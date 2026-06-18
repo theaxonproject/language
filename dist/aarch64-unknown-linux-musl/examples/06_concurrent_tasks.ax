@@ -1,0 +1,18 @@
+use Core
+use Task.{ Channel }
+
+fn worker(id: int, out: Channel(str))
+    out.send(f"worker {id} done")
+
+fn main() -> int
+    let out = Channel(str).new(buffer: 3)
+
+    task_group do
+        task do worker(1, out)
+        task do worker(2, out)
+        task do worker(3, out)
+
+    for _ in 0..3 do
+        println(out.recv())
+
+    return 0

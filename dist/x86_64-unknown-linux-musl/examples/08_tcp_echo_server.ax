@@ -1,0 +1,19 @@
+use Core
+use Net.{ TcpListener, TcpStream }
+
+fn handle_client(mut stream: TcpStream)
+    let mut buf = [0_u8; 4096]
+
+    loop do
+        let n = try stream.read(mut ref buf)
+        if n == 0 then
+            break
+        try stream.write_all(buf[0..n])
+
+fn main() -> int
+    let listener = try TcpListener.bind("127.0.0.1:7000")
+    println("listening on 127.0.0.1:7000")
+
+    loop do
+        let stream = try listener.accept()
+        task do handle_client(stream)

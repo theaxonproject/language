@@ -1,0 +1,16 @@
+use Cli.{ App }
+use Core
+use Io.{ File }
+use Process
+
+fn main() -> int
+    let app = App.new(name: "count-lines", version: "1.0.0")
+        .arg("file", help: "File to read")
+
+    let matches = try app.parse()
+    let path = try matches.value("file")
+    let text = try File.open(path).read_all_text()
+    let count = text.split("\n").len()
+
+    println(f"{path}: {count}")
+    return 0

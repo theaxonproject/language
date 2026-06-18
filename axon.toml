@@ -1,0 +1,29 @@
+[package]
+name = "axon/toolchain"
+version = "1.0.0"
+description = "AXON language specification, compiler, standard library, and toolchain"
+authors = ["Marcel R."]
+license = "MIT"
+homepage = "https://m5rcel.neocities.org/axon"
+repository = "https://github.com/m4rcel-lol/axon"
+keywords = ["compiler", "language", "toolchain"]
+categories = ["development-tools"]
+
+[features]
+default = ["tls", "lsp"]
+tls = []
+lsp = []
+
+[profile.debug]
+opt_level = 0
+debug_info = true
+overflow_checks = true
+assertions = true
+lto = false
+
+[profile.release]
+opt_level = 3
+debug_info = false
+overflow_checks = false
+assertions = false
+lto = true

@@ -1,0 +1,21 @@
+use Core
+use Io.{ File }
+use Json
+
+@derive(Json)
+struct Config
+    name: str
+    port: uint16
+
+fn read_config(path: str) -> Config!ConfigError
+    let text = try File.open(path).read_all_text()
+    let config = try Json.parse_as(Config)(text)
+    return config
+
+fn main() -> int
+    let config = try read_config("server.json") catch err then
+        eprintln(f"config error: {err}")
+        return 1
+
+    println(f"starting {config.name} on {config.port}")
+    return 0

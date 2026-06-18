@@ -1,0 +1,427 @@
+use axstd.collections.{ Map, Vec }
+use axstd.concurrency.{ Arc, Mutex, RwLock }
+use axstd.crypto.{ sha256, hmac_sha256, random_bytes, base64_encode }
+use axstd.http.{ HttpServer, Request, Response, Router, StatusCode }
+use axstd.json
+use axstd.log.{ Logger, LogLevel }
+use axstd.process.env
+use axstd.time.{ Instant, Duration, DateTime }
+use axstd.str
+
+
+struct Config
+    host: str
+    port: uint16
+    secret: str
+    rate_limit: uint32
+    token_ttl_secs: uint64
+
+impl Config
+    fn from_env() -> Config
+        return Config{
+            host: env.get("HOST").unwrap_or("0.0.0.0"),
+            port: env.get("PORT").unwrap_or("8080").parse(uint16).unwrap_or(8080),
+            secret: env.get("SECRET").unwrap_or("changeme_in_production"),
+            rate_limit: env.get("RATE_LIMIT").unwrap_or("100").parse(uint32).unwrap_or(100),
+            token_ttl_secs: env.get("TOKEN_TTL").unwrap_or("3600").parse(uint64).unwrap_or(3600),
+        }
+
+
+struct Task
+    id: str
+    title: str
+    body: str
+    done: bool
+    owner: str
+    created_at: str
+    updated_at: str
+
+@derive(Json)
+struct TaskPayload
+    title: str
+    body: str
+
+@derive(Json)
+struct UpdatePayload
+    title: str?
+    body: str?
+    done: bool?
+
+@derive(Json)
+struct LoginPayload
+    username: str
+    password: str
+
+@derive(Json)
+struct TokenResponse
+    token: str
+    expires_at: str
+
+@derive(Json)
+struct ErrorResponse
+    error: str
+    code: uint32
+
+@derive(Json)
+struct TaskListResponse
+    tasks: Vec(Task)
+    total: uint32
+    page: uint32
+    per_page: uint32
+
+
+struct RateEntry
+    count: uint32
+    window_start: Instant
+
+struct Store
+    tasks: RwLock(Map(str, Task))
+    users: RwLock(Map(str, str))
+    tokens: RwLock(Map(str, (str, Instant)))
+    rate_map: Mutex(Map(str, RateEntry))
+    config: Config
+    log: Logger
+
+impl Store
+    fn new(config: Config) -> Store
+        let log = Logger.new("axon-tasks")
+        log.set_level(LogLevel.INFO)
+
+        let users = Map(str, str).new()
+        users.insert("admin", hash_password("admin123", config.secret))
+        users.insert("alice", hash_password("alice456", config.secret))
+
+        return Store{
+            tasks: RwLock.new(Map(str, Task).new()),
+            users: RwLock.new(users),
+            tokens: RwLock.new(Map(str, (str, Instant)).new()),
+            rate_map: Mutex.new(Map(str, RateEntry).new()),
+            config: config,
+            log: log,
+        }
+
+    fn check_rate_limit(mut self, ip: str) -> bool
+        let mut map = self.rate_map.lock()
+        let now = Instant.now()
+        let window = Duration.from_secs(60)
+
+        match map.get_mut(ip) do
+            case Some(entry) then
+                if now.since(entry.window_start) > window then
+                    entry.count = 1
+                    entry.window_start = now
+                    return true
+                if entry.count >= self.config.rate_limit then
+                    return false
+                entry.count = entry.count + 1
+                return true
+            case None then
+                map.insert(ip, RateEntry{ count: 1, window_start: now })
+                return true
+
+    fn authenticate(self, token: str) -> str?
+        let tokens = self.tokens.read()
+        match tokens.get(token) do
+            case Some((username, issued_at)) then
+                let age = Instant.now().since(*issued_at).as_secs()
+                if age > self.config.token_ttl_secs then
+                    return None
+                return Some(*username)
+            case None then
+                return None
+
+    fn login(mut self, username: str, password: str) -> TokenResponse?
+        let users = self.users.read()
+        let stored = users.get(username)?
+        let hashed = hash_password(password, self.config.secret)
+        if *stored != hashed then
+            return None
+        let token = generate_token(username, self.config.secret)
+        let expires = DateTime.now().add(Duration.from_secs(self.config.token_ttl_secs))
+        let expires_str = expires.format_iso8601()
+        self.tokens.write().insert(token, (username, Instant.now()))
+        self.log.info(f"login: user={username}")
+        return Some(TokenResponse{ token: token, expires_at: expires_str })
+
+    fn create_task(mut self, owner: str, payload: TaskPayload) -> Task
+        let id = generate_id()
+        let now = DateTime.now().format_iso8601()
+        let task = Task{
+            id: id,
+            title: payload.title.trim(),
+            body: payload.body.trim(),
+            done: false,
+            owner: owner,
+            created_at: now,
+            updated_at: now,
+        }
+        self.tasks.write().insert(task.id, task)
+        self.log.info(f"task.create: id={task.id} owner={owner}")
+        return task
+
+    fn get_task(self, id: str, owner: str) -> Task?
+        let tasks = self.tasks.read()
+        let task = tasks.get(id)?
+        if task.owner != owner then
+            return None
+        return Some(*task)
+
+    fn update_task(mut self, id: str, owner: str, patch: UpdatePayload) -> Task?
+        let mut tasks = self.tasks.write()
+        let task = tasks.get_mut(id)?
+        if task.owner != owner then
+            return None
+        if let Some(title) = patch.title then
+            task.title = title.trim()
+        if let Some(body) = patch.body then
+            task.body = body.trim()
+        if let Some(done) = patch.done then
+            task.done = done
+        task.updated_at = DateTime.now().format_iso8601()
+        self.log.info(f"task.update: id={id} owner={owner}")
+        return Some(*task)
+
+    fn delete_task(mut self, id: str, owner: str) -> bool
+        let mut tasks = self.tasks.write()
+        match tasks.get(id) do
+            case Some(task) then
+                if task.owner != owner then
+                    return false
+                tasks.remove(id)
+                self.log.info(f"task.delete: id={id} owner={owner}")
+                return true
+            case None then
+                return false
+
+    fn list_tasks(self, owner: str, page: uint32, per_page: uint32, filter_done: bool?) -> TaskListResponse
+        let tasks = self.tasks.read()
+        let mut owned: Vec(Task) = tasks
+            .values()
+            .filter(t => t.owner == owner)
+            .filter(t => match filter_done do
+                case Some(done) then t.done == done
+                case None then true)
+            .collect()
+
+        owned.sort_by(a, b => a.created_at.compare(b.created_at))
+
+        let total = owned.len() as uint32
+        let start = ((page - 1) * per_page) as uint
+        let end = (start + per_page as uint).min(owned.len())
+        let page_items = owned.slice(start..end).to_vec()
+
+        return TaskListResponse{
+            tasks: page_items,
+            total: total,
+            page: page,
+            per_page: per_page,
+        }
+
+
+fn hash_password(password: str, secret: str) -> str
+    return base64_encode(hmac_sha256(secret, password))
+
+fn generate_token(username: str, secret: str) -> str
+    let nonce = base64_encode(random_bytes(24))
+    return base64_encode(hmac_sha256(secret, f"{username}:{nonce}:{Instant.now().as_nanos()}"))
+
+fn generate_id() -> str
+    return base64_encode(random_bytes(12))
+        .replace("+", "-")
+        .replace("/", "_")
+        .replace("=", "")
+
+fn extract_bearer(req: Request) -> str?
+    let header = req.headers.get("Authorization")?
+    if not header.starts_with("Bearer ") then
+        return None
+    return Some(header.slice(7..))
+
+fn extract_ip(req: Request) -> str
+    return req.headers.get("X-Forwarded-For")
+        .unwrap_or(req.remote_addr.split(":").first().unwrap_or("unknown"))
+
+fn json_error(status: StatusCode, message: str, code: uint32) -> Response
+    return Response.new(status)
+        .header("Content-Type", "application/json")
+        .body(json.stringify(ErrorResponse{ error: message, code: code }))
+
+fn json_ok(val: any) -> Response
+    return Response.new(StatusCode.OK)
+        .header("Content-Type", "application/json")
+        .body(json.stringify(val))
+
+
+fn handle_login(store: Arc(Store), req: Request) -> Response
+    let body = match json.parse(req.body) do
+        case Ok(val) then val
+        case Err(_) then return json_error(StatusCode.BAD_REQUEST, "invalid json", 1001)
+
+    let payload = match LoginPayload.from_json(body) do
+        case Ok(p) then p
+        case Err(_) then return json_error(StatusCode.BAD_REQUEST, "missing fields", 1002)
+
+    if payload.username.len() == 0 or payload.password.len() == 0 then
+        return json_error(StatusCode.BAD_REQUEST, "username and password required", 1003)
+
+    match store.login(payload.username, payload.password) do
+        case Some(resp) then return json_ok(resp)
+        case None then return json_error(StatusCode.UNAUTHORIZED, "invalid credentials", 1004)
+
+
+fn handle_list_tasks(store: Arc(Store), req: Request) -> Response
+    let token = match extract_bearer(req) do
+        case Some(t) then t
+        case None then return json_error(StatusCode.UNAUTHORIZED, "missing token", 2001)
+
+    let owner = match store.authenticate(token) do
+        case Some(u) then u
+        case None then return json_error(StatusCode.UNAUTHORIZED, "token expired or invalid", 2002)
+
+    let page = req.query.get("page").unwrap_or("1").parse(uint32).unwrap_or(1).max(1)
+    let per_page = req.query.get("per_page").unwrap_or("20").parse(uint32).unwrap_or(20).clamp(1, 100)
+    let filter_done = match req.query.get("done") do
+        case Some("true") then Some(true)
+        case Some("false") then Some(false)
+        case _ then None
+
+    return json_ok(store.list_tasks(owner, page, per_page, filter_done))
+
+
+fn handle_create_task(store: Arc(Store), req: Request) -> Response
+    let token = match extract_bearer(req) do
+        case Some(t) then t
+        case None then return json_error(StatusCode.UNAUTHORIZED, "missing token", 2001)
+
+    let owner = match store.authenticate(token) do
+        case Some(u) then u
+        case None then return json_error(StatusCode.UNAUTHORIZED, "token expired or invalid", 2002)
+
+    let body = match json.parse(req.body) do
+        case Ok(val) then val
+        case Err(_) then return json_error(StatusCode.BAD_REQUEST, "invalid json", 1001)
+
+    let payload = match TaskPayload.from_json(body) do
+        case Ok(p) then p
+        case Err(_) then return json_error(StatusCode.BAD_REQUEST, "missing fields", 1002)
+
+    if payload.title.len() == 0 then
+        return json_error(StatusCode.BAD_REQUEST, "title cannot be empty", 1005)
+
+    if payload.title.len() > 200 then
+        return json_error(StatusCode.BAD_REQUEST, "title too long (max 200 chars)", 1006)
+
+    let task = store.create_task(owner, payload)
+    return Response.new(StatusCode.CREATED)
+        .header("Content-Type", "application/json")
+        .body(json.stringify(task))
+
+
+fn handle_get_task(store: Arc(Store), req: Request) -> Response
+    let token = match extract_bearer(req) do
+        case Some(t) then t
+        case None then return json_error(StatusCode.UNAUTHORIZED, "missing token", 2001)
+
+    let owner = match store.authenticate(token) do
+        case Some(u) then u
+        case None then return json_error(StatusCode.UNAUTHORIZED, "token expired or invalid", 2002)
+
+    let id = req.params.get("id").unwrap_or("")
+    if id.len() == 0 then
+        return json_error(StatusCode.BAD_REQUEST, "missing task id", 1007)
+
+    match store.get_task(id, owner) do
+        case Some(task) then return json_ok(task)
+        case None then return json_error(StatusCode.NOT_FOUND, "task not found", 3001)
+
+
+fn handle_update_task(store: Arc(Store), req: Request) -> Response
+    let token = match extract_bearer(req) do
+        case Some(t) then t
+        case None then return json_error(StatusCode.UNAUTHORIZED, "missing token", 2001)
+
+    let owner = match store.authenticate(token) do
+        case Some(u) then u
+        case None then return json_error(StatusCode.UNAUTHORIZED, "token expired or invalid", 2002)
+
+    let id = req.params.get("id").unwrap_or("")
+    if id.len() == 0 then
+        return json_error(StatusCode.BAD_REQUEST, "missing task id", 1007)
+
+    let body = match json.parse(req.body) do
+        case Ok(val) then val
+        case Err(_) then return json_error(StatusCode.BAD_REQUEST, "invalid json", 1001)
+
+    let patch = match UpdatePayload.from_json(body) do
+        case Ok(p) then p
+        case Err(_) then return json_error(StatusCode.BAD_REQUEST, "invalid patch body", 1008)
+
+    if let Some(title) = patch.title then
+        if title.trim().len() == 0 then
+            return json_error(StatusCode.BAD_REQUEST, "title cannot be empty", 1005)
+        if title.len() > 200 then
+            return json_error(StatusCode.BAD_REQUEST, "title too long (max 200 chars)", 1006)
+
+    match store.update_task(id, owner, patch) do
+        case Some(task) then return json_ok(task)
+        case None then return json_error(StatusCode.NOT_FOUND, "task not found", 3001)
+
+
+fn handle_delete_task(store: Arc(Store), req: Request) -> Response
+    let token = match extract_bearer(req) do
+        case Some(t) then t
+        case None then return json_error(StatusCode.UNAUTHORIZED, "missing token", 2001)
+
+    let owner = match store.authenticate(token) do
+        case Some(u) then u
+        case None then return json_error(StatusCode.UNAUTHORIZED, "token expired or invalid", 2002)
+
+    let id = req.params.get("id").unwrap_or("")
+    if id.len() == 0 then
+        return json_error(StatusCode.BAD_REQUEST, "missing task id", 1007)
+
+    if store.delete_task(id, owner) then
+        return Response.new(StatusCode.NO_CONTENT)
+    return json_error(StatusCode.NOT_FOUND, "task not found", 3001)
+
+
+fn with_rate_limit(store: Arc(Store), req: Request, next: fn(Request) -> Response) -> Response
+    let ip = extract_ip(req)
+    if not store.check_rate_limit(ip) then
+        return json_error(StatusCode.TOO_MANY_REQUESTS, "rate limit exceeded", 4001)
+    return next(req)
+
+
+fn main() -> void
+    let config = Config.from_env()
+    let addr = f"{config.host}:{config.port}"
+
+    let store = Arc.new(Store.new(config))
+    let log = store.log
+
+    log.info(f"starting axon-tasks on {addr}")
+    log.info(f"rate limit: {store.config.rate_limit} req/min per ip")
+    log.info(f"token ttl: {store.config.token_ttl_secs}s")
+
+    let s1 = store.clone()
+    let s2 = store.clone()
+    let s3 = store.clone()
+    let s4 = store.clone()
+    let s5 = store.clone()
+    let s6 = store.clone()
+
+    let router = Router.new()
+        .post("/auth/login", fn(req) = with_rate_limit(s1, req, fn(r) = handle_login(s2, r)))
+        .get("/tasks", fn(req) = with_rate_limit(s3, req, fn(r) = handle_list_tasks(s4, r)))
+        .post("/tasks", fn(req) = with_rate_limit(s3, req, fn(r) = handle_create_task(s4, r)))
+        .get("/tasks/:id", fn(req) = with_rate_limit(s5, req, fn(r) = handle_get_task(s6, r)))
+        .patch("/tasks/:id", fn(req) = with_rate_limit(s5, req, fn(r) = handle_update_task(s6, r)))
+        .delete("/tasks/:id", fn(req) = with_rate_limit(s5, req, fn(r) = handle_delete_task(s6, r)))
+        .fallback(fn(_req) = json_error(StatusCode.NOT_FOUND, "route not found", 404))
+
+    HttpServer.new(router)
+        .bind(addr)
+        .workers(8)
+        .keep_alive(Duration.from_secs(30))
+        .on_error(fn(err) = log.error(f"server error: {err}"))
+        .serve()

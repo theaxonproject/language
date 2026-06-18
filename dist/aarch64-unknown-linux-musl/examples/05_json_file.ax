@@ -1,0 +1,13 @@
+use Core
+use Io.{ File }
+use Json
+
+fn main() -> int
+    let text = try File.open("config.json").read_all_text()
+    let value = try Json.parse(text)
+
+    match value.get("name") do
+        case Some(name) then println(f"name: {name}")
+        case none then println("missing name")
+
+    return 0

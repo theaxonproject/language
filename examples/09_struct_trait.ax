@@ -1,0 +1,29 @@
+use Core
+use Math
+
+trait Shape
+    fn area(self) -> float64
+
+struct Circle
+    radius: float64
+
+impl Circle
+    fn new(radius: float64) -> Circle
+        return Circle{ radius: radius }
+
+    fn scale(mut self, factor: float64)
+        self.radius = self.radius * factor
+
+impl Circle as Shape
+    fn area(self) -> float64
+        return Math.PI * self.radius * self.radius
+
+impl Circle as Printable
+    fn print(self) -> str
+        return f"Circle(radius: {self.radius})"
+
+fn main() -> int
+    let c = Circle.new(4.0)
+    println(c.print())
+    println(f"area: {c.area()}")
+    return 0

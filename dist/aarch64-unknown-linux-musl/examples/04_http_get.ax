@@ -1,0 +1,10 @@
+use Core
+use Http.{ HttpClient }
+
+fn main() -> int
+    let client = HttpClient.new()
+    let response = try client.get("https://m5rcel.neocities.org/axon")
+
+    println(f"status: {response.status}")
+    println(try response.text())
+    return 0
