@@ -32,6 +32,11 @@ mkdir -p "$bin_dir" "$tool_impl_dir" "$stdlib_dir"
 cp "$repo_root/tools/axon_tool.py" "$tool_impl_dir/axon_tool.py"
 chmod 0644 "$tool_impl_dir/axon_tool.py"
 
+# Copy the compiler package (lexer, parser, checker, interpreter, C backend).
+cp -R "$repo_root/tools/axonc" "$tool_impl_dir/axonc"
+find "$tool_impl_dir/axonc" -name '__pycache__' -type d -prune -exec rm -rf {} +
+chmod -R 0644 "$tool_impl_dir/axonc"/*.py "$tool_impl_dir/axonc"/*.c 2>/dev/null || true
+
 for tool in "${tools[@]}"; do
     cat > "$bin_dir/$tool" <<SCRIPT
 #!/usr/bin/env sh

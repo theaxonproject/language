@@ -1,0 +1,16 @@
+# Python bytecode caches
+__pycache__/
+*.pyc
+*.pyo
+
+# AXON build output
+/target/
+**/target/
+
+# Compiled native binaries from examples (kept out of source control)
+/*.out
+fib
+hello
+
+# OS noise
+.DS_Store
