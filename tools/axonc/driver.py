@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -70,27 +71,56 @@ def run_path(path: pathlib.Path, args: list[str], color: bool = False) -> int:
         return 101
 
 
+def find_c_compiler() -> str:
+    """Locate the host C compiler: $CC, then cc/gcc/clang, then MSVC's cl."""
+    env_cc = os.environ.get("CC")
+    if env_cc:
+        return env_cc
+    for candidate in ("cc", "gcc", "clang", "cl"):
+        if shutil.which(candidate):
+            return candidate
+    return "cc"
+
+
+def native_output_path(output: pathlib.Path) -> pathlib.Path:
+    """Native executables need an `.exe` suffix on Windows."""
+    if os.name == "nt" and output.suffix.lower() != ".exe":
+        return output.with_suffix(output.suffix + ".exe")
+    return output
+
+
 def compile_native(module: ast.Module, source_path: pathlib.Path,
-                   output: pathlib.Path, release: bool) -> None:
+                   output: pathlib.Path, release: bool) -> pathlib.Path:
     """Compile to a native executable via the C backend. Raises Diagnostic on
-    unsupported constructs (E800) or C-compiler failure (E810)."""
+    unsupported constructs (E800) or C-compiler failure (E810). Returns the
+    path of the produced executable (which gains `.exe` on Windows)."""
     c_source = generate_c(module)
-    cc = os.environ.get("CC", "cc")
+    cc = find_c_compiler()
+    output = native_output_path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    is_msvc = pathlib.Path(cc).stem.lower() == "cl"
     with tempfile.TemporaryDirectory(prefix="axon-cc-") as tmp:
         c_file = pathlib.Path(tmp) / (source_path.stem + ".c")
         c_file.write_text(c_source, encoding="utf-8")
-        flags = ["-O2", "-flto"] if release else ["-O0", "-g"]
-        cmd = [cc, "-std=c11", *flags, "-o", str(output), str(c_file), "-lm"]
+        if is_msvc:
+            opt = "/O2" if release else "/Od"
+            cmd = [cc, "/nologo", "/std:c11", opt, str(c_file),
+                   f"/Fe:{output}", f"/Fo:{tmp}\\"]
+        else:
+            flags = ["-O2", "-flto"] if release else ["-O0", "-g"]
+            cmd = [cc, "-std=c11", *flags, "-o", str(output), str(c_file), "-lm"]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
+            detail = (result.stderr.strip() + "\n" + result.stdout.strip()).strip()
             raise Diagnostic(
                 "E810",
-                f"the C compiler failed:\n{result.stderr.strip()}",
+                f"the C compiler failed:\n{detail}",
                 None,
                 "this usually indicates an internal backend bug; please report it",
             )
-    output.chmod(0o755)
+    if os.name != "nt":
+        output.chmod(0o755)
+    return output
 
 
 def _package_files() -> dict[str, str]:
@@ -149,8 +179,8 @@ def compile_path(source_path: pathlib.Path, output: pathlib.Path,
     if diagnostics:
         return 1
     try:
-        compile_native(module, source_path, output, release)
-        print(f"compiled {output} (native)")
+        produced = compile_native(module, source_path, output, release)
+        print(f"compiled {produced} (native)")
         return 0
     except Diagnostic as d:
         if d.code == "E800":

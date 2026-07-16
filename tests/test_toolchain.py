@@ -6,6 +6,7 @@ executables.
 """
 
 import importlib.util
+import os
 import pathlib
 import shutil
 import subprocess
@@ -37,7 +38,22 @@ from axonc.checker import check_module  # noqa: E402
 from axonc.interp import Interpreter  # noqa: E402
 from axonc.cbackend import generate_c  # noqa: E402
 
-HAVE_CC = shutil.which("cc") is not None or shutil.which("gcc") is not None
+HAVE_CC = any(shutil.which(cc) for cc in ("cc", "gcc", "clang", "cl"))
+
+# native executables' magic bytes: ELF (Linux), Mach-O (macOS), PE (Windows)
+NATIVE_MAGIC = (b"\x7fELF", b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"MZ\x90\x00", b"MZ")
+
+
+def native_path(path: pathlib.Path) -> pathlib.Path:
+    """The executable path `axc compile -o path` actually produces."""
+    if os.name == "nt" and path.suffix.lower() != ".exe":
+        return path.with_suffix(path.suffix + ".exe")
+    return path
+
+
+def is_native_binary(path: pathlib.Path) -> bool:
+    head = path.read_bytes()[:4]
+    return any(head.startswith(m) for m in NATIVE_MAGIC)
 
 # canonical examples that compile natively today
 NATIVE_EXAMPLES = ["01_hello", "02_fizzbuzz", "03_fibonacci", "09_struct_trait"]
@@ -174,21 +190,20 @@ class NativeBackendTests(unittest.TestCase):
 
     def test_compile_produces_native_executable(self):
         with tempfile.TemporaryDirectory() as tmp:
-            out = pathlib.Path(tmp) / "hello"
+            out = native_path(pathlib.Path(tmp) / "hello")
             result = axon("axc", "compile", str(EXAMPLES / "01_hello.ax"), "-o", str(out))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("native", result.stdout)
             self.assertTrue(out.exists())
-            head = out.read_bytes()[:4]
-            # genuine native binary: ELF (Linux) or Mach-O (macOS), not a script
-            self.assertIn(head[:4], (b"\x7fELF", b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe"))
+            # genuine native binary: ELF, Mach-O, or PE — not a script
+            self.assertTrue(is_native_binary(out), out.read_bytes()[:4])
             run = subprocess.run([str(out)], cwd=tmp, text=True, capture_output=True)
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertEqual(run.stdout.strip(), "Hello, World")
 
     def test_native_fibonacci_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
-            out = pathlib.Path(tmp) / "fib"
+            out = native_path(pathlib.Path(tmp) / "fib")
             axon("axc", "compile", str(EXAMPLES / "03_fibonacci.ax"), "-o", str(out))
             run = subprocess.run([str(out)], cwd=tmp, text=True, capture_output=True)
             self.assertIn("recursive: 55", run.stdout)
@@ -202,7 +217,10 @@ class NativeBackendTests(unittest.TestCase):
             result = axon("axc", "compile", "main.ax", "-o", "app", cwd=tmpdir)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("portable", result.stderr)
-            run = subprocess.run([str(out)], cwd=tmpdir, text=True, capture_output=True)
+            # portable artifacts are python launchers; invoke via the
+            # interpreter on Windows where shebangs don't apply
+            cmd = [str(out)] if os.name != "nt" else [sys.executable, str(out)]
+            run = subprocess.run(cmd, cwd=tmpdir, text=True, capture_output=True)
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertEqual(run.stdout.strip(), "name: axon")
 
@@ -254,9 +272,12 @@ class ProjectWorkflowTests(unittest.TestCase):
             build = axon("axbuild", "build", cwd=project)
             self.assertEqual(build.returncode, 0, build.stderr)
             binary = project / "target" / "debug" / "hello"
-            self.assertTrue(binary.exists())
             if HAVE_CC:
-                self.assertEqual(binary.read_bytes()[:4], b"\x7fELF") if sys.platform.startswith("linux") else None
+                binary = native_path(binary)
+                self.assertTrue(binary.exists())
+                self.assertTrue(is_native_binary(binary))
+            else:
+                self.assertTrue(binary.exists())
             run = axon("axbuild", "run", cwd=project)
             self.assertEqual(run.stdout.strip(), "Hello, World", run.stderr)
             self.assertEqual(axon("axbuild", "test", cwd=project).returncode, 0)

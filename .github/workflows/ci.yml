@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run the toolchain test suite
+        run: python -m unittest discover -s tests -v
+      - name: Check the canonical examples
+        run: python tools/axon_tool.py axc check examples/01_hello.ax examples/02_fizzbuzz.ax examples/03_fibonacci.ax examples/04_http_get.ax examples/05_json_file.ax examples/06_concurrent_tasks.ax examples/07_cli_tool.ax examples/08_tcp_echo_server.ax examples/09_struct_trait.ax examples/10_error_chain.ax
+      - name: Lint the canonical examples
+        run: python tools/axon_tool.py axlint examples/01_hello.ax examples/02_fizzbuzz.ax examples/03_fibonacci.ax examples/04_http_get.ax examples/05_json_file.ax examples/06_concurrent_tasks.ax examples/07_cli_tool.ax examples/08_tcp_echo_server.ax examples/09_struct_trait.ax examples/10_error_chain.ax
+      - name: Formatter is idempotent on the examples
+        run: python tools/axon_tool.py axfmt --check examples

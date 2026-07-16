@@ -44,6 +44,10 @@ Remove-Item -LiteralPath $distRoot -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $sourceDir -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $binDir, $stdlibDir, $toolImplDir, $sourceDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $repoRoot "tools\axon_tool.py") -Destination (Join-Path $toolImplDir "axon_tool.py") -Force
+# the full compiler package (lexer, parser, checker, interpreter, C backend)
+Copy-Item -LiteralPath (Join-Path $repoRoot "tools\axonc") -Destination (Join-Path $toolImplDir "axonc") -Recurse -Force
+Get-ChildItem -Path (Join-Path $toolImplDir "axonc") -Recurse -Directory -Filter "__pycache__" |
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
 $program = @'
 using System;

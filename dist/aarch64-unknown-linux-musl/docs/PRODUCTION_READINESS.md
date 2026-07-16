@@ -55,16 +55,28 @@ This keeps `compile` total while the native backend's coverage grows.
 
 Compiled natively today: functions/recursion, scalar types (`int`/`uint`
 family, `float`, `bool`, `str`), structs with methods and trait methods (static
-dispatch), `if`/`for`-range/`while`/`loop`, arithmetic/comparison/bitwise
-operators, f-strings, and core I/O + panic intrinsics.
+dispatch), enums (C-style and tagged unions with payloads), `match` lowering
+(literal/variant/wildcard/or-patterns, bindings, guards, runtime
+non-exhaustiveness panic), `if let`, the `Option`/`Result` ABI with `try`/`?`
+propagation and inline/block `catch` handlers, monomorphized `Vec(T)` and
+`Map(str, V)` with their method sets, global constants, the string method
+library, numeric methods/casts, file I/O (`File.open/read/write/exists`),
+`if`/`for`-range/`for`-over-Vec/`while`/`loop`, `and`/`or`/`not`,
+arithmetic/comparison/bitwise operators, f-strings (with recursive value
+formatting for structs, enums, options, results, vectors, and maps), and core
+I/O + assert + panic intrinsics.
 
-In progress for the native backend (works in the interpreter today): `match`
-lowering and exhaustiveness-checked decision trees, `Option`/`Result` ABI and
-`try`/`?` propagation, closures and monomorphized generics, enums with payloads,
-the heap-backed collection ABI (`Vec`/`Map`), and the networked/JSON standard
-library. Each lands behind the same public toolchain contract: stable error
-codes, stable spans, and identical observable behavior between `axc run` and a
-compiled binary.
+Native/interpreter parity is enforced by `tests/test_native_backend.py`, which
+compiles each feature program natively AND runs it under the interpreter,
+asserting byte-identical output.
+
+In progress for the native backend (works in the interpreter today): closures
+and higher-order Vec methods (`map`/`filter`/`sort_by`), user generics and
+monomorphization, tuples, `defer`, optional chaining (`?.`), tasks/channels,
+and the networked/JSON standard library. Each lands behind the same public
+toolchain contract: stable error codes, stable spans, and identical observable
+behavior between `axc run` and a compiled binary. See `docs/ROADMAP.md` for
+the full plan.
 
 ## Compatibility Policy
 
