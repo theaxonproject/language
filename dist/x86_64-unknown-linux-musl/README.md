@@ -55,14 +55,20 @@ cd hello
 
 Natively compiled today: functions and recursion, the scalar types
 (`int`/`uint` family, `float`, `bool`, `str`), structs with methods and trait
-methods (static dispatch), `if`/`for`-range/`while`/`loop` control flow,
-arithmetic/comparison/bitwise operators, f-strings, and the core I/O and panic
-intrinsics.
+methods (static dispatch), enums — both C-style and with payloads (tagged
+unions), `match` with literal/variant/or-patterns and guards, `if let`,
+`Option`/`Result` with `try`/`?` propagation and `catch` handlers, `Vec` and
+`Map(str, V)` collections (monomorphized, with the full method set), global
+constants, the string method library (`split`/`trim`/`contains`/`replace`/
+`parse`/slicing/...), numeric methods and casts, file I/O,
+`if`/`for`/`while`/`loop` control flow, `and`/`or`/`not`,
+arithmetic/comparison/bitwise operators, f-strings, and the core I/O, assert,
+and panic intrinsics. Compiled binaries and `axc run` produce identical output
+— that parity is enforced by the test suite.
 
 Available through the interpreter (and the portable artifact): the above plus
-`match`/pattern matching, `Option`/`Result` with `try`/`?`, closures, enums,
-optional chaining, defer, structured-concurrency syntax, and the core standard
-library (collections, JSON, files, HTTP client, CLI, TCP).
+closures, optional chaining, defer, structured-concurrency syntax, and the
+networked standard library (JSON, HTTP client, CLI, TCP).
 
 See [docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) for the exact
 release gates and what is in-progress, and

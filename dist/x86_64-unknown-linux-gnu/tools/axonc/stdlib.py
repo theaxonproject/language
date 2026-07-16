@@ -436,18 +436,23 @@ def _unwrap_json(value: Any) -> Any:
 
 
 def _file_static(name: str, args: list) -> Any:
+    if name == "exists":
+        return os.path.exists(args[0])
     if name == "open":
         path = args[0]
         if not os.path.exists(path):
             raise AxPanic(f"file not found: {path}")
         return AxFile(path)
     if name == "read_to_string":
-        with open(args[0], "r", encoding="utf-8") as fh:
-            return ok(fh.read())
+        try:
+            with open(args[0], "r", encoding="utf-8") as fh:
+                return ok(fh.read())
+        except OSError:
+            return err("cannot read file")
     if name == "write":
         with open(args[0], "w", encoding="utf-8") as fh:
             fh.write(args[1])
-        return ok(None)
+        return ok(True)
     raise AxPanic(f"File has no member `{name}`")
 
 

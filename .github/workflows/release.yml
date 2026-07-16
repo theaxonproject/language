@@ -1,0 +1,88 @@
+name: Release
+
+# Pushing a tag such as v1.1.0 runs the full test suite on every platform,
+# stages the per-target distributions, and publishes a GitHub Release with
+# downloadable archives for Linux (gnu/musl, x86_64/aarch64), macOS
+# (x86_64/aarch64), and Windows (x86_64).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover -s tests -v
+
+  package-unix:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stage Unix distributions
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [ -z "$version" ] || [ "$version" = "$GITHUB_REF_NAME" ] && [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            version="0.0.0-dev"
+          fi
+          mkdir -p out
+          for target in \
+              x86_64-unknown-linux-gnu x86_64-unknown-linux-musl \
+              aarch64-unknown-linux-gnu aarch64-unknown-linux-musl \
+              x86_64-apple-darwin aarch64-apple-darwin; do
+            ./packaging/stage-dist.sh "$version" "$target"
+            tar -czf "out/axon-$version-$target.tar.gz" -C dist "$target"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-unix
+          path: out/*.tar.gz
+
+  package-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Stage Windows distribution
+        shell: pwsh
+        run: |
+          $version = "$env:GITHUB_REF_NAME".TrimStart("v")
+          if (-not $version -or "$env:GITHUB_REF_TYPE" -ne "tag") { $version = "0.0.0-dev" }
+          ./packaging/windows/stage-dist.ps1 -Version $version -Target x86_64-pc-windows-msvc
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Compress-Archive -Path "dist/x86_64-pc-windows-msvc" -DestinationPath "out/axon-$version-x86_64-pc-windows-msvc.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: out/*.zip
+
+  release:
+    needs: [package-unix, package-windows]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true

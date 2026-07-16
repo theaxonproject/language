@@ -501,11 +501,18 @@ class Parser:
                 # could be `try EXPR catch e then` block form
                 save = self.pos
                 self.advance()  # try
-                inner = self.parse_expr()
+                inner = self.parse_binary(PREC["or"] + 1)
                 if self.at("KW", "catch"):
                     self.advance()
                     catch_name = self.advance().value
                     self.expect("KW", "then")
+                    if not self.at("NEWLINE"):
+                        # inline form: `let x = try EXPR catch e then EXPR`
+                        value = ast.TryExpr(start, inner)
+                        value.catch_name = catch_name
+                        value.catch_expr = self.parse_expr()
+                        self.end_statement()
+                        return ast.LetStmt(start, name, type_ann, value, is_mut)
                     self.expect("NEWLINE")
                     catch_block = self.parse_block()
                     value = ast.TryExpr(start, inner)
@@ -686,7 +693,9 @@ class Parser:
     def parse_expr(self) -> ast.Expr:
         if self.at("KW", "try"):
             start = self.advance().span
-            inner = self.parse_binary(0)
+            # bind tighter than `or` so `try x or fallback` keeps its
+            # fallback meaning rather than parsing as a boolean-or
+            inner = self.parse_binary(PREC["or"] + 1)
             node = ast.TryExpr(start, inner)
             self.maybe_inline_try_tail(node)
             return node
@@ -736,7 +745,7 @@ class Parser:
         while True:
             tok = self.peek()
             op = tok.value
-            if tok.kind == "KW" and op == "is":
+            if tok.kind == "KW" and op in {"is", "and", "or"}:
                 pass
             elif tok.kind != "OP":
                 break

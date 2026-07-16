@@ -39,6 +39,13 @@ class PropagateSignal(Exception):
         self.value = value
 
 
+_SCALAR_TYPE_NAMES = {
+    "int", "int8", "int16", "int32", "int64",
+    "uint", "uint8", "uint16", "uint32", "uint64",
+    "float32", "float64", "bool", "byte", "rune", "str",
+}
+
+
 class Env:
     __slots__ = ("vars", "parent")
 
@@ -420,13 +427,24 @@ class Interpreter:
             return self._enum_constructor(owner, name)
         if name in self.structs or name in self.enums or name[0:1].isupper():
             return AxType(name)
+        if name in _SCALAR_TYPE_NAMES:
+            return AxType(name)
         raise AxPanic(f"unknown symbol: {name}")
 
     def _enum_constructor(self, owner: str, variant: str):
         vdef = next(v for v in self.enums[owner].variants if v.name == variant)
         if not vdef.payload:
             return AxEnum(owner, variant, [], [])
-        return lambda *vals: AxEnum(owner, variant, list(vals), [n for n, _ in vdef.payload])
+        names = [n for n, _ in vdef.payload]
+
+        def construct(*vals, **kwargs):
+            payload = list(vals)
+            for name in names[len(payload):]:
+                if name is not None and name in kwargs:
+                    payload.append(kwargs[name])
+            return AxEnum(owner, variant, payload, names)
+
+        return construct
 
     def eval_fstr(self, node: ast.FStr, env: Env) -> str:
         out = []
@@ -684,7 +702,9 @@ class Interpreter:
             child = Env(env)
             child.define(node.catch_name or "_", failval)
             return self.eval(node.catch_expr, child)
-        raise PropagateSignal(failval if kind is AxResult else NONE)
+        # propagate the failure to the caller, keeping the Result/Option
+        # wrapper so `try` at the call site still sees a failure value
+        raise PropagateSignal(err(failval) if kind is AxResult else NONE)
 
     def eval_pipe(self, node: ast.PipeExpr, env: Env) -> Any:
         left = self.eval(node.left, env)
