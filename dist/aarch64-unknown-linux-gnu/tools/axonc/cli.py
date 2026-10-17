@@ -49,7 +49,7 @@ def command_axc(argv: list[str]) -> int:
         print(f"axc {VERSION}")
         return 0
     if not argv or argv[0] in {"--help", "-h"}:
-        print("usage: axc <check FILES... | run FILE [args] | compile FILE [-o OUT] [--release]>")
+        print("usage: axc <check FILES... | run [--release | --interpret] FILE [args...] | compile FILE [-o OUT] [--release]>")
         return 0 if argv else 2
     cmd = argv[0]
     if cmd == "check":
@@ -58,10 +58,16 @@ def command_axc(argv: list[str]) -> int:
             return 2
         return driver.check_paths([pathlib.Path(p) for p in argv[1:]], _color())
     if cmd == "run":
-        if len(argv) < 2:
-            print("axc run requires a file", file=sys.stderr)
-            return 2
-        return driver.run_path(pathlib.Path(argv[1]), argv[2:], _color())
+        parser = argparse.ArgumentParser(prog="axc run", description="Compile and execute a native AXON program.")
+        mode = parser.add_mutually_exclusive_group()
+        mode.add_argument("--release", action="store_true", help="enable native compiler optimizations")
+        mode.add_argument("--interpret", action="store_true", help="use the interpreter instead of compiling")
+        parser.add_argument("file")
+        parser.add_argument("args", nargs=argparse.REMAINDER, help="arguments passed to the program")
+        ns = parser.parse_args(argv[1:])
+        if ns.interpret:
+            return driver.run_path(pathlib.Path(ns.file), ns.args, _color())
+        return driver.run_native_path(pathlib.Path(ns.file), ns.args, _color(), ns.release)
     # compile (explicit or bare file)
     args = argv[1:] if cmd == "compile" else argv[:]
     output: str | None = None

@@ -1519,6 +1519,14 @@ class CBackend:
                 fn = self.functions[name]
                 args = self._order_args(fn, node.args, ctx, w, node.span)
                 return f"{self._cname(fn, None)}({', '.join(args)})", self.type_tag(fn.return_type)
+            if name == "read_line" and not node.args:
+                tag = ("opt", "str")
+                self.ensure(tag)
+                line, result = ctx.tmp(), ctx.tmp()
+                w.line(f"AxStr {line};")
+                w.line(f"{self.ctype(tag)} {result} = ax_opt_none_str();")
+                w.line(f"if (ax_read_line(&{line})) {result} = ax_opt_some_str({line});")
+                return result, tag
             if name in {"max", "min"} and len(node.args) == 2:
                 a, atag = self._emit_expr(node.args[0].value, ctx, w)
                 b, _ = self._emit_expr(node.args[1].value, ctx, w, expect=atag)

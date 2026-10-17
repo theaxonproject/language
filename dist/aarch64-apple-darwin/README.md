@@ -21,7 +21,7 @@ The compiler is a clean, dependency-free pipeline (standard-library Python only)
 | Lexer | `tools/axonc/lexer.py` | Character-level scanner with significant indentation (`INDENT`/`DEDENT`) and source spans |
 | Parser | `tools/axonc/parser.py` | Recursive-descent parser producing a typed AST (`tools/axonc/ast.py`) |
 | Analyzer | `tools/axonc/checker.py` | Name resolution, duplicate detection, struct-field validation, stable error codes |
-| Interpreter | `tools/axonc/interp.py` | Executes the full language for `axc run` and the REPL |
+| Interpreter | `tools/axonc/interp.py` | Executes the full language for `axc run --interpret` and the REPL |
 | Native backend | `tools/axonc/cbackend.py` + `runtime.c` | Lowers the compiled core to C11 and invokes the host C compiler to produce a native binary |
 
 `axc compile` prefers the native backend (a real, standalone machine-code
@@ -38,8 +38,14 @@ AXC=dist/aarch64-unknown-linux-gnu/bin/axc
 # type-check
 $AXC check examples/*.ax
 
-# run through the interpreter
+# compile to a temporary native executable and run it
 $AXC run examples/03_fibonacci.ax
+
+# optimize before running (options go before the source file)
+$AXC run --release examples/03_fibonacci.ax
+
+# explicitly use the interpreter for features outside the native backend
+$AXC run --interpret examples/03_fibonacci.ax
 
 # compile to a native executable (requires a C compiler: cc/gcc/clang)
 $AXC compile examples/03_fibonacci.ax -o fib
@@ -50,6 +56,15 @@ dist/aarch64-unknown-linux-gnu/bin/axbuild new hello
 cd hello
 ../dist/aarch64-unknown-linux-gnu/bin/axbuild run
 ```
+
+`axc run [--release] FILE [args...]` requires a host C compiler and executes
+native code. It preserves the current directory, standard input/output/error,
+and the program's exit status, then removes the temporary executable. Arguments
+after `FILE` are passed unchanged to the executable. The native backend does
+not yet implement the `Cli` module; programs using it require `--interpret`.
+Native compilation errors stop execution; `run` never silently falls back to
+the interpreter. Use `axc run --interpret FILE [args...]` explicitly when needed.
+`axbuild run/test` and the REPL continue to use the interpreter.
 
 ## Implemented language surface
 
@@ -63,7 +78,7 @@ constants, the string method library (`split`/`trim`/`contains`/`replace`/
 `parse`/slicing/...), numeric methods and casts, file I/O,
 `if`/`for`/`while`/`loop` control flow, `and`/`or`/`not`,
 arithmetic/comparison/bitwise operators, f-strings, and the core I/O, assert,
-and panic intrinsics. Compiled binaries and `axc run` produce identical output
+and panic intrinsics. Compiled binaries and `axc run --interpret` produce identical output
 — that parity is enforced by the test suite.
 
 Available through the interpreter (and the portable artifact): the above plus

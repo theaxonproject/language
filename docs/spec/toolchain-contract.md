@@ -4,6 +4,17 @@ All AXON tools use the same lexer, parser, resolver, type checker, and package
 graph model. A source file accepted by one tool must have identical syntax and
 semantic meaning in every other tool.
 
+## axc execution
+
+`axc run [--release] FILE [args...]` compiles FILE with the native C backend
+and runs the resulting executable. A host C compiler is required. Compiler
+options precede FILE; arguments after FILE belong to the program. Execution
+inherits the caller's working directory and standard streams, returns the
+program's exit status, and removes the temporary executable afterward.
+Unsupported native constructs fail with E800 rather than falling back to an
+interpreter. `axc run --interpret FILE [args...]` explicitly selects the
+interpreter for the broader implemented language surface.
+
 ## axbuild
 
 `axbuild` is the project build system.

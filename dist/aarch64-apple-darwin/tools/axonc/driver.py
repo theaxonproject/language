@@ -71,6 +71,36 @@ def run_path(path: pathlib.Path, args: list[str], color: bool = False) -> int:
         return 101
 
 
+def run_native_path(path: pathlib.Path, args: list[str], color: bool = False,
+                    release: bool = False) -> int:
+    """Build and execute native code, preserving cwd, stdio, and program args.
+
+    Unlike compile_path, this never falls back to an interpreter artifact.
+    The temporary executable is removed after the child exits.
+    """
+    try:
+        module = load_module(path)
+        diagnostics = check_module(module)
+        for d in diagnostics:
+            print(d.render(color), file=sys.stderr)
+        if diagnostics:
+            return 1
+        with tempfile.TemporaryDirectory(prefix="axon-run-") as tmp:
+            executable = compile_native(module, path, pathlib.Path(tmp) / "app", release)
+            result = subprocess.run([str(executable.resolve()), *args])
+            return result.returncode if result.returncode >= 0 else 128 - result.returncode
+    except Diagnostic as d:
+        print(d.render(color), file=sys.stderr)
+        if d.code == "E800":
+            print("Use axc run --interpret FILE [args...] to run this program with the interpreter.",
+                  file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(Diagnostic("E810", f"could not build or execute native program: {exc}").render(color),
+              file=sys.stderr)
+        return 1
+
+
 def find_c_compiler() -> str:
     """Locate the host C compiler: $CC, then cc/gcc/clang, then MSVC's cl."""
     env_cc = os.environ.get("CC")
@@ -109,7 +139,13 @@ def compile_native(module: ast.Module, source_path: pathlib.Path,
         else:
             flags = ["-O2", "-flto"] if release else ["-O0", "-g"]
             cmd = [cc, "-std=c11", *flags, "-o", str(output), str(c_file), "-lm"]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+        except OSError as exc:
+            raise Diagnostic(
+                "E810", f"could not launch C compiler `{cc}`: {exc}", None,
+                "install a C compiler (cc/gcc/clang) or set CC to its executable path",
+            ) from exc
         if result.returncode != 0:
             detail = (result.stderr.strip() + "\n" + result.stdout.strip()).strip()
             raise Diagnostic(

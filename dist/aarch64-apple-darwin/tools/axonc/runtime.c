@@ -176,6 +176,34 @@ static bool ax_str_contains(AxStr s, AxStr needle) {
     return false;
 }
 
+/* Blocking console input. Blank lines are values; EOF is absence. */
+static bool ax_read_line(AxStr *out) {
+    fflush(stdout);
+    size_t len = 0, cap = 128;
+    char *buf = (char *)ax_alloc(cap);
+    int ch;
+    while ((ch = fgetc(stdin)) != EOF && ch != '\n') {
+        if (len + 1 >= cap) {
+            cap *= 2;
+            buf = (char *)ax_realloc(buf, cap);
+        }
+        buf[len++] = (char)ch;
+    }
+    if (ferror(stdin)) {
+        free(buf);
+        ax_panic(ax_str_lit("cannot read stdin"));
+    }
+    if (ch == EOF && len == 0) {
+        free(buf);
+        return false;
+    }
+    if (ch == '\n' && len && buf[len - 1] == '\r') len--;
+    buf[len] = '\0';
+    out->data = buf;
+    out->len = (int64_t)len;
+    return true;
+}
+
 static bool ax_str_starts_with(AxStr s, AxStr prefix) {
     return prefix.len <= s.len &&
            memcmp(s.data, prefix.data, (size_t)prefix.len) == 0;

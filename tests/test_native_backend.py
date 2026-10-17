@@ -3,7 +3,7 @@
 Each test compiles an AXON program to a native executable AND runs the same
 program through the interpreter, asserting that both succeed and produce
 identical output. This pins the central toolchain contract: identical
-observable behavior between `axc run` and a compiled binary.
+observable behavior between `axc run --interpret` and a compiled binary.
 """
 
 import os
@@ -38,7 +38,7 @@ def compile_and_run(source: str, expect_native: bool = True,
         if setup:
             setup(tmpdir)
         interp = subprocess.run(
-            [sys.executable, str(AXON_TOOL), "axc", "run", "main.ax"],
+            [sys.executable, str(AXON_TOOL), "axc", "run", "--interpret", "main.ax"],
             cwd=tmpdir, text=True, capture_output=True)
         assert interp.returncode == 0, interp.stderr
         out = tmpdir / "app"

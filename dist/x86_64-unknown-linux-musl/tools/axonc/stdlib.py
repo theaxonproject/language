@@ -43,6 +43,22 @@ def _eprint(*args: Any) -> None:
     sys.stderr.write(" ".join(ax_str(a) for a in args))
 
 
+def _read_line() -> AxOption:
+    """Read stdin without its line ending; return None at EOF."""
+    sys.stdout.flush()
+    try:
+        line = sys.stdin.readline()
+    except (OSError, UnicodeError) as exc:
+        raise AxPanic(f"cannot read stdin: {exc}") from exc
+    if line == "":
+        return NONE
+    if line.endswith("\n"):
+        line = line[:-1]
+        if line.endswith("\r"):
+            line = line[:-1]
+    return some(line)
+
+
 def _panic(msg: Any = "explicit panic") -> None:
     raise AxPanic(ax_str(msg))
 
@@ -68,6 +84,7 @@ def _values_equal(a: Any, b: Any) -> bool:
 
 
 BUILTIN_FUNCTIONS = {
+    "read_line": _read_line,
     "println": _println,
     "print": _print,
     "eprintln": _eprintln,

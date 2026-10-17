@@ -140,17 +140,17 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(run_source(src), 55)
 
     def test_hello_output(self):
-        result = axon("axc", "run", str(EXAMPLES / "01_hello.ax"))
+        result = axon("axc", "run", "--interpret", str(EXAMPLES / "01_hello.ax"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "Hello, World")
 
     def test_fibonacci_output(self):
-        result = axon("axc", "run", str(EXAMPLES / "03_fibonacci.ax"))
+        result = axon("axc", "run", "--interpret", str(EXAMPLES / "03_fibonacci.ax"))
         self.assertIn("recursive: 55", result.stdout)
         self.assertIn("iterative: 55", result.stdout)
 
     def test_struct_trait_output(self):
-        result = axon("axc", "run", str(EXAMPLES / "09_struct_trait.ax"))
+        result = axon("axc", "run", "--interpret", str(EXAMPLES / "09_struct_trait.ax"))
         self.assertIn("Circle(radius: 4.0)", result.stdout)
         self.assertIn("area: 50.26548245743669", result.stdout)
 
@@ -231,7 +231,7 @@ class StdlibExampleTests(unittest.TestCase):
             tmpdir = pathlib.Path(tmp)
             (tmpdir / "main.ax").write_text((EXAMPLES / "05_json_file.ax").read_text())
             (tmpdir / "config.json").write_text('{"name":"axon"}')
-            result = axon("axc", "run", "main.ax", cwd=tmpdir)
+            result = axon("axc", "run", "--interpret", "main.ax", cwd=tmpdir)
             self.assertEqual(result.stdout.strip(), "name: axon", result.stderr)
 
     def test_cli_example(self):
@@ -239,7 +239,7 @@ class StdlibExampleTests(unittest.TestCase):
             tmpdir = pathlib.Path(tmp)
             (tmpdir / "main.ax").write_text((EXAMPLES / "07_cli_tool.ax").read_text())
             (tmpdir / "input.txt").write_text("a\nb\nc\n")
-            result = axon("axc", "run", "main.ax", "input.txt", cwd=tmpdir)
+            result = axon("axc", "run", "--interpret", "main.ax", "input.txt", cwd=tmpdir)
             self.assertEqual(result.stdout.strip(), "input.txt: 4", result.stderr)
 
     def test_error_chain_example(self):
@@ -247,7 +247,7 @@ class StdlibExampleTests(unittest.TestCase):
             tmpdir = pathlib.Path(tmp)
             (tmpdir / "main.ax").write_text((EXAMPLES / "10_error_chain.ax").read_text())
             (tmpdir / "server.json").write_text('{"name":"svc","port":8080}')
-            result = axon("axc", "run", "main.ax", cwd=tmpdir)
+            result = axon("axc", "run", "--interpret", "main.ax", cwd=tmpdir)
             self.assertEqual(result.stdout.strip(), "starting svc on 8080", result.stderr)
 
 

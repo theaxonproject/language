@@ -51,11 +51,24 @@ fn print(args: ...any)
 fn println(args: ...any)
 fn eprint(args: ...any)
 fn eprintln(args: ...any)
+fn read_line() -> Option(str)
 fn type_name(T)() -> str
 fn size_of(T)() -> uint
 fn todo(msg: str) -> never
 fn unreachable() -> never
 fn unimplemented() -> never
+```
+
+`read_line()` flushes stdout, then blocks for one line from standard input.
+It allocates a string and returns `Some(text)` without the LF or CRLF line
+ending. A blank line is `Some("")`; EOF before any characters is `None`.
+An unterminated final line is returned before EOF. I/O failure panics.
+Both native programs and the interpreter implement this function.
+
+```axon
+print("Name: ")
+if let Some(name) = read_line() then
+    println(f"Hello, {name}")
 ```
 
 ## Collection Required Types

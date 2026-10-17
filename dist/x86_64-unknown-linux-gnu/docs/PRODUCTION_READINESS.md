@@ -17,7 +17,7 @@ The compiler in `tools/axonc/` is a real, staged pipeline:
   detection), duplicate-definition detection, struct-field validation, with
   stable error codes and precise spans.
 - **Interpreter** (`interp.py` + `stdlib.py`): a tree-walking evaluator that
-  executes the full implemented language surface, used by `axc run`, `axbuild
+  executes the full implemented language surface, used by `axc run --interpret`, `axbuild
   run/test`, and the REPL.
 - **Native backend** (`cbackend.py` + `runtime.c`): lowers the statically-typed
   core of the AST to portable C11 and invokes the host C compiler to produce a
@@ -25,12 +25,20 @@ The compiler in `tools/axonc/` is a real, staged pipeline:
 
 ## Toolchain surface
 
-- `axc check`, `axc run`, `axc compile` (native, with portable fallback).
+- `axc check`, `axc run` (native execution), `axc run --interpret` (explicit
+  interpreter execution), `axc compile` (native, with portable fallback).
 - `axbuild new/check/build/run/test/fmt/lint/clean/doc/cross`.
 - `axfmt` (idempotent formatter), `axlint` (style + semantic diagnostics).
 - `axpkg`, `axup`, `axls` (JSON-RPC language server), `axrepl`.
 
 ## Native vs portable artifacts
+
+`axc run [--release] FILE [args...]` compiles to a temporary native executable,
+runs it with the caller's working directory and standard streams, propagates
+its exit status, and cleans up the executable. All semantic and compilation
+errors stop execution. Unsupported native features report E800 and suggest
+`axc run --interpret FILE [args...]`; there is no automatic fallback in `run`.
+Options precede FILE; subsequent arguments are forwarded to the executable.
 
 `axc compile` and `axbuild build` first attempt native compilation through the C
 backend. If the program uses a construct the native backend does not yet cover,
@@ -75,7 +83,7 @@ and higher-order Vec methods (`map`/`filter`/`sort_by`), user generics and
 monomorphization, tuples, `defer`, optional chaining (`?.`), tasks/channels,
 and the networked/JSON standard library. Each lands behind the same public
 toolchain contract: stable error codes, stable spans, and identical observable
-behavior between `axc run` and a compiled binary. See `docs/ROADMAP.md` for
+behavior between `axc run --interpret` and a compiled binary. See `docs/ROADMAP.md` for
 the full plan.
 
 ## Compatibility Policy
