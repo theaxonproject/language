@@ -70,7 +70,9 @@ String forms are:
 
 - `"text"` for escaped UTF-8 strings
 - `r"raw \n text"` for raw strings
-- `f"Hello {name}"` for interpolation
+- `f"Hello {name}"` for interpolation; an interpolation is any expression,
+  including one that contains string literals: `f"{name.unwrap_or("anon")}"`.
+  `{{` and `}}` produce literal braces.
 - `"""multi line"""` for heredoc strings
 
 Character literals use single quotes and must contain one Unicode scalar value.
@@ -93,11 +95,28 @@ The following table lists operators from highest to lowest precedence.
 | 6 | `and` | left | no |
 | 5 | `or` | left | no |
 | 4 | `|>` | left | no |
+| 3 | `..` (exclusive range), `..=` (inclusive range) | non-assoc | no |
 | 3 | `try`, `try catch`, `try or` | right | no |
 | 2 | `if then else`, `match` | right | no |
-| 1 | lambda `fn(...) = ...`, `x => ...` | right | no |
+| 1 | lambda `fn(...) = ...`, `x => ...`, `(a, b) => ...` | right | no |
 
 Assignment operators are statements, not expressions.
+
+Operands are evaluated left to right, including function arguments, operator
+operands, and the fields of struct, tuple, and list literals.
+
+`a..b` is the half-open range `[a, b)` and `a..=b` the closed range `[a, b]`.
+
+### Integer Arithmetic
+
+`int` arithmetic is 64-bit two's complement. In debug builds (the default, and
+always in the interpreter) `+`, `-`, `*`, unary `-`, `pow`, and division of
+`INT_MIN` by `-1` panic with `integer overflow`; `--release` builds wrap.
+Integer division truncates toward zero and `%` takes the sign of the dividend,
+as in C. Division or modulo by zero panics. Shift amounts outside `0..64`
+panic. Float division by zero follows IEEE 754 (`inf`, `-inf`, `nan`).
+Converting a float to an integer truncates toward zero and panics on `nan`,
+infinities, and out-of-range values. `float.round()` rounds half away from zero.
 
 `->` is a return-type delimiter, not an operator. It is retained because AXON's
 required toolchain and examples use it. It cannot be overloaded.
@@ -173,6 +192,10 @@ containing pointer and length. Arrays coerce to slices when borrowed.
 Indexing is checked in debug mode and unchecked in release mode unless the
 package profile enables release bounds checks.
 
+`str` lengths, indices, and slices are measured in UTF-8 bytes; `chars()`
+yields Unicode scalar values. `"héllo".len()` is 6 and
+`"héllo".chars().len()` is 5.
+
 ### Optional
 
 `T?` is either `Some(T)` or `none`. Optional values must be explicitly handled
@@ -205,6 +228,21 @@ AXON uses bidirectional local type inference.
 
 The implementation uses union-find unification variables, an occurs check, and
 generalization only at `let` bindings that do not capture mutable references.
+
+### Static Checks (1.2 implementation)
+
+`axc check` (and every command that compiles or runs a program) type-checks
+the whole module before execution. It reports type mismatches (E110), wrong
+argument counts and unknown named arguments (E111), unknown fields and
+methods on user and builtin types (E103, E104), non-exhaustive `match` over
+enums, `Option`, `Result`, `bool`, and tuples of those (E112), invalid or
+missing returns (E121, E123), assignment to or mutation of immutable bindings
+(E122), `catch` blocks that fall through (E124), `break`/`continue` outside a
+loop (E125), and `impl ... as Trait` blocks missing required methods (E126).
+
+Integers widen to floats implicitly; floats never narrow to integers without
+`as`. Values whose type the checker cannot see into (undeclared library types
+and generic type parameters) are accepted rather than guessed at.
 
 ## 5. Ownership and Memory
 
@@ -249,9 +287,22 @@ Optional chaining `a?.b` evaluates to `none` if `a` is `none`, otherwise project
 Statements include declarations, assignments, returns, loop control, `defer`,
 expression statements, and compound control flow.
 
-`defer expr` registers an expression to run when the enclosing scope exits.
-Defers run in last-in, first-out order on normal return, error propagation, and
-panic unwinding.
+`defer expr` registers an expression to run when the enclosing block exits.
+Defers run in last-in, first-out order on normal block exit, `return`,
+`break`, `continue`, and `try` error propagation. (The interpreter also runs
+them during panic unwinding; native executables terminate on panic.)
+
+`let` binds a single name or destructures a tuple:
+
+```axon
+let (name, age) = ("ada", 36)
+for (index, word) in words.enumerate() do
+    println(f"{index}: {word}")
+```
+
+Bindings are immutable unless declared `let mut`. Calling a mutating method
+(`push`, `pop`, `insert`, `remove`, `clear`, `extend`) on a `Vec` or `Map`
+requires a mutable binding.
 
 ## 8. Functions and Closures
 
@@ -271,7 +322,28 @@ listed values into the closure according to normal ownership rules.
 ```axon
 let add_one = fn(x: int) -> int = x + 1
 let twice = x => x * 2
+let add = (a, b) => a + b
 let owned = capture(name) fn() -> str = name
+```
+
+A bare closure takes exactly one parameter (`x => ...`); several parameters
+need parentheses (`(a, b) => ...`), so `f(a, b => c)` is unambiguous. Closure
+parameter and return types are inferred from the expected function type
+(`fn(int) -> int`) when one is known. `try` inside a closure propagates out of
+the closure, not out of the enclosing function.
+
+Named functions are values: `nums.map(double)`.
+
+Generic functions declare their type parameters in brackets and are
+monomorphized at each call site:
+
+```axon
+fn largest[T](items: Vec(T)) -> T?
+    let mut best: T? = none
+    for it in items do
+        if best.is_none() or it > best.unwrap() then
+            best = Some(it)
+    return best
 ```
 
 ## 9. Structs, Traits, and Impl Blocks
@@ -279,11 +351,14 @@ let owned = capture(name) fn() -> str = name
 Methods are defined in `impl` blocks. `self` is immutable unless written
 `mut self`.
 
-Traits define required methods, associated types, and default methods.
+Traits define required methods (signatures without a body), associated types,
+and default methods. Every implementing type inherits the default methods it
+does not override.
 
 ```axon
 trait Printable
     fn print(self) -> str
+    fn show(self) -> str = f"<{self.print()}>"
 
 impl Point as Printable
     fn print(self) -> str

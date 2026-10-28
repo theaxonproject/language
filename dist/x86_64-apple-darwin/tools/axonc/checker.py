@@ -9,6 +9,8 @@ It is intentionally conservative: identifiers that could refer to an external
 type or imported module (PascalCase names, imported aliases) are accepted rather
 than risk false positives, while undefined *value* identifiers — the common
 class of real typo — are reported.
+
+`check_module` then runs the static type checker (`typecheck.py`).
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from __future__ import annotations
 from . import ast
 from . import stdlib
 from .errors import Diagnostic
+from .typecheck import check_types
 
 # Builtin value functions and well-known library type/module names that are
 # always in scope. The interpreter and C runtime provide these.
@@ -124,7 +127,10 @@ class Checker:
         if k is ast.LetStmt:
             if stmt.value is not None:
                 self._check_expr(stmt.value, scopes)
-            scopes[-1].add(stmt.name)
+            if stmt.pattern is not None:
+                scopes[-1].update(self._pattern_names(stmt.pattern))
+            else:
+                scopes[-1].add(stmt.name)
             if stmt.catch_block is not None:
                 inner = scopes + [{stmt.catch_name}]
                 self._check_block(stmt.catch_block, inner)
@@ -285,4 +291,8 @@ class Checker:
 
 
 def check_module(module: ast.Module) -> list[Diagnostic]:
-    return Checker(module).check()
+    """Name resolution followed by static type checking."""
+    diagnostics = Checker(module).check()
+    diagnostics.extend(check_types(module))
+    diagnostics.sort(key=lambda d: (d.span.line, d.span.column) if d.span else (0, 0))
+    return diagnostics

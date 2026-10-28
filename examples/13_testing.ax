@@ -1,0 +1,41 @@
+use Core
+
+## Unit tests live next to the code they test. Run them with
+##     axc test examples/13_testing.ax
+## Each `@test` function passes when it returns normally (or returns `Ok`),
+## and fails on a panic, a failed assertion, or an `Err` result.
+
+fn fizzbuzz(n: int) -> str
+    return match (n % 3, n % 5) do
+        case (0, 0) then "FizzBuzz"
+        case (0, _) then "Fizz"
+        case (_, 0) then "Buzz"
+        case _ then n.to_string()
+
+fn mean(values: Vec(float64)) -> float64!str
+    if values.is_empty() then
+        return Err("mean of an empty list")
+    return Ok(values.fold(0.0, (acc, v) => acc + v) / values.len() as float64)
+
+@test
+fn fizzbuzz_words()
+    assert_eq(fizzbuzz(3), "Fizz")
+    assert_eq(fizzbuzz(10), "Buzz")
+    assert_eq(fizzbuzz(30), "FizzBuzz")
+    assert_eq(fizzbuzz(7), "7")
+
+@test
+fn mean_of_values() -> bool!str
+    let m = try mean([1.0, 2.0, 6.0])
+    assert_eq(m, 3.0)
+    return Ok(true)
+
+@test
+fn mean_rejects_empty()
+    assert(mean([]).is_err(), "an empty list has no mean")
+
+fn main() -> int
+    for n in 1..=15 do
+        print(f"{fizzbuzz(n)} ")
+    println()
+    return 0

@@ -19,8 +19,8 @@ import urllib.request
 from typing import Any
 
 from .values import (
-    AxEnum, AxOption, AxPanic, AxRange, AxResult, AxStruct, AxType,
-    NONE, ax_str, err, ok, some,
+    INT_MAX, INT_MIN, AxEnum, AxExit, AxOption, AxPanic, AxRange, AxResult,
+    AxStruct, AxType, NONE, ax_str, ax_type_name, check_int, err, ok, some,
 )
 
 
@@ -83,6 +83,10 @@ def _values_equal(a: Any, b: Any) -> bool:
     return a == b
 
 
+def _int_abs(v: Any) -> Any:
+    return check_int(abs(v))
+
+
 BUILTIN_FUNCTIONS = {
     "read_line": _read_line,
     "println": _println,
@@ -95,19 +99,76 @@ BUILTIN_FUNCTIONS = {
     "todo": lambda msg="not yet implemented": _panic(msg),
     "unreachable": lambda msg="entered unreachable code": _panic(msg),
     "unimplemented": lambda msg="not implemented": _panic(msg),
-    "type_name": lambda v=None: type(v).__name__,
+    "type_name": lambda v=None: ax_type_name(v),
     "size_of": lambda v=None: 8,
     "len": lambda v: _length(v),
     "max": lambda a, b: a if a >= b else b,
     "min": lambda a, b: a if a <= b else b,
-    "abs": lambda a: abs(a),
+    "abs": _int_abs,
 }
 
 
 def _length(v: Any) -> int:
-    if isinstance(v, AxRange):
-        return len(v)
+    if isinstance(v, str):
+        return _byte_len(v)
     return len(v)
+
+
+# --------------------------------------------------------------------------- #
+# Strings
+#
+# `str` is UTF-8. Lengths, indices, and slices count bytes, exactly like the
+# native runtime; `chars()` yields Unicode scalar values.
+# --------------------------------------------------------------------------- #
+_ASCII_SPACE = " \t\n\r\f\v"
+
+
+def _byte_len(s: str) -> int:
+    return len(s.encode("utf-8"))
+
+
+def _byte_slice(s: str, start: int | None, stop: int | None) -> str:
+    return s.encode("utf-8")[start:stop].decode("utf-8", "replace")
+
+
+def _byte_index(s: str, i: int) -> str:
+    data = s.encode("utf-8")
+    if i < 0:
+        i += len(data)
+    if not 0 <= i < len(data):
+        raise AxPanic("string index out of range")
+    return data[i:i + 1].decode("utf-8", "replace")
+
+
+def _byte_find(s: str, sub: str) -> int:
+    return s.encode("utf-8").find(sub.encode("utf-8"))
+
+
+def _ascii_upper(s: str) -> str:
+    return "".join(chr(ord(c) - 32) if "a" <= c <= "z" else c for c in s)
+
+
+def _ascii_lower(s: str) -> str:
+    return "".join(chr(ord(c) + 32) if "A" <= c <= "Z" else c for c in s)
+
+
+def _split_lines(s: str) -> list:
+    out = []
+    start = 0
+    for i, ch in enumerate(s):
+        if ch == "\n":
+            end = i - 1 if i > start and s[i - 1] == "\r" else i
+            out.append(s[start:end])
+            start = i + 1
+    if start < len(s):
+        out.append(s[start:])
+    return out
+
+
+def _check_str(name: str, *values: Any) -> None:
+    for v in values:
+        if not isinstance(v, str):
+            raise AxPanic(f"str.{name} expects a str argument, got {ax_type_name(v)}")
 
 
 # --------------------------------------------------------------------------- #
@@ -133,73 +194,141 @@ def builtin_method(interp, recv: Any, name: str, args: list, kwargs: dict) -> An
     if isinstance(recv, AxRange):
         if name == "len":
             return len(recv)
+        if name in {"to_vec", "collect", "iter"}:
+            return list(recv)
+    if isinstance(recv, tuple):
+        if name == "len":
+            return len(recv)
     if isinstance(recv, _MISC_TYPES):
         return recv.method(interp, name, args, kwargs)
-    raise AxPanic(f"value of type {type(recv).__name__} has no method `{name}`")
+    raise AxPanic(f"value of type {ax_type_name(recv)} has no method `{name}`")
 
 
 def _str_method(s: str, name: str, args: list, kwargs: dict) -> Any:
     if name == "len":
-        return len(s)
+        return _byte_len(s)
     if name == "is_empty":
         return len(s) == 0
+    if name == "to_string":
+        return s
     if name == "trim":
-        return s.strip()
+        return s.strip(_ASCII_SPACE)
     if name == "trim_start":
-        return s.lstrip()
+        return s.lstrip(_ASCII_SPACE)
     if name == "trim_end":
-        return s.rstrip()
+        return s.rstrip(_ASCII_SPACE)
     if name == "to_upper" or name == "to_uppercase":
-        return s.upper()
+        return _ascii_upper(s)
     if name == "to_lower" or name == "to_lowercase":
-        return s.lower()
+        return _ascii_lower(s)
     if name == "split":
-        sep = args[0] if args else None
-        return [p for p in (s.split(sep) if sep is not None else s.split())]
+        if not args:
+            return _split_ws(s)
+        _check_str(name, args[0])
+        if args[0] == "":
+            return [s]
+        return s.split(args[0])
+    if name == "split_once":
+        _check_str(name, args[0])
+        sep = args[0]
+        if sep and sep in s:
+            head, _, tail = s.partition(sep)
+            return some((head, tail))
+        return NONE
     if name == "lines":
-        return s.splitlines()
+        return _split_lines(s)
     if name == "replace":
-        return s.replace(args[0], args[1])
+        _check_str(name, args[0], args[1])
+        return s if args[0] == "" else s.replace(args[0], args[1])
     if name == "starts_with":
+        _check_str(name, args[0])
         return s.startswith(args[0])
     if name == "ends_with":
+        _check_str(name, args[0])
         return s.endswith(args[0])
+    if name == "strip_prefix":
+        _check_str(name, args[0])
+        return some(s[len(args[0]):]) if s.startswith(args[0]) else NONE
+    if name == "strip_suffix":
+        _check_str(name, args[0])
+        if not s.endswith(args[0]):
+            return NONE
+        return some(s[:len(s) - len(args[0])])
     if name == "contains":
+        _check_str(name, args[0])
         return args[0] in s
+    if name == "find":
+        _check_str(name, args[0])
+        idx = _byte_find(s, args[0])
+        return some(idx) if idx >= 0 else NONE
     if name == "chars":
         return list(s)
     if name == "bytes":
         return list(s.encode("utf-8"))
     if name == "compare":
         other = args[0]
-        return (s > other) - (s < other)
+        a, b = s.encode("utf-8"), other.encode("utf-8")
+        return (a > b) - (a < b)
     if name == "slice":
         return _apply_slice(s, args[0])
     if name == "parse":
         return _str_parse(s, args[0] if args else None)
     if name == "repeat":
-        return s * int(args[0])
+        return s * max(0, int(args[0]))
     raise AxPanic(f"str has no method `{name}`")
+
+
+def _split_ws(s: str) -> list:
+    out, cur = [], ""
+    for ch in s:
+        if ch in _ASCII_SPACE:
+            if cur:
+                out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur:
+        out.append(cur)
+    return out
 
 
 def _str_parse(s: str, ty: Any) -> Any:
     type_name = ty.name if isinstance(ty, AxType) else str(ty)
-    try:
-        if type_name.startswith("int") or type_name.startswith("uint") or type_name in {"int", "uint", "byte"}:
-            return ok(int(s.strip()))
-        if type_name.startswith("float"):
-            return ok(float(s.strip()))
-        if type_name == "bool":
-            return ok(s.strip() == "true")
-        return ok(s)
-    except ValueError:
-        return err(f"cannot parse '{s}' as {type_name}")
+    text = s.strip(_ASCII_SPACE)
+    if type_name.startswith("int") or type_name.startswith("uint") or type_name in {"int", "uint", "byte"}:
+        digits = text[1:] if text[:1] in {"+", "-"} else text
+        if not digits or not digits.isascii() or not digits.isdigit():
+            return err("parse error")
+        value = int(text)
+        if not INT_MIN <= value <= INT_MAX:
+            return err("parse error")
+        return ok(value)
+    if type_name.startswith("float"):
+        try:
+            if "_" in text or not text.isascii():
+                raise ValueError(text)
+            return ok(float(text))
+        except ValueError:
+            return err("parse error")
+    if type_name == "bool":
+        return ok(text == "true")
+    return ok(s)
 
 
 def _bool_method(b: bool, name: str, args: list) -> Any:
     if name == "to_string":
         return "true" if b else "false"
     raise AxPanic(f"bool has no method `{name}`")
+
+
+def _int_pow(base: int, exp: int) -> int:
+    if exp < 0:
+        return 0
+    return check_int(base ** exp)
+
+
+def _round_half_away(x: float) -> int:
+    return check_int(math.floor(x + 0.5) if x >= 0 else math.ceil(x - 0.5))
 
 
 def _int_method(n: int, name: str, args: list) -> Any:
@@ -210,13 +339,19 @@ def _int_method(n: int, name: str, args: list) -> Any:
     if name == "min":
         return min(n, args[0])
     if name == "abs":
-        return abs(n)
+        return check_int(abs(n))
     if name == "clamp":
         return max(args[0], min(n, args[1]))
     if name == "pow":
-        return n ** int(args[0])
+        return _int_pow(n, int(args[0]))
     if name == "to_float":
         return float(n)
+    if name == "is_even":
+        return n % 2 == 0
+    if name == "is_odd":
+        return n % 2 != 0
+    if name == "signum":
+        return (n > 0) - (n < 0)
     raise AxPanic(f"int has no method `{name}`")
 
 
@@ -224,25 +359,45 @@ def _float_method(x: float, name: str, args: list) -> Any:
     if name == "to_string":
         return ax_str(x)
     if name == "floor":
-        return math.floor(x)
+        return check_int(math.floor(x))
     if name == "ceil":
-        return math.ceil(x)
+        return check_int(math.ceil(x))
     if name == "round":
-        return round(x)
+        return _round_half_away(x)
     if name == "sqrt":
-        return math.sqrt(x)
+        return math.sqrt(x) if x >= 0 else math.nan
     if name == "abs":
         return abs(x)
     if name == "max":
         return max(x, args[0])
     if name == "min":
         return min(x, args[0])
+    if name == "pow":
+        return math.pow(x, args[0])
     if name == "to_int":
-        return int(x)
+        return check_int(int(x))
+    if name == "is_nan":
+        return math.isnan(x)
     raise AxPanic(f"float has no method `{name}`")
 
 
+def _vec_index(lst: list, i: int) -> int:
+    if i < 0:
+        i += len(lst)
+    if not 0 <= i < len(lst):
+        raise AxPanic("index out of range")
+    return i
+
+
+def _positive(n: Any, what: str) -> int:
+    n = int(n)
+    if n <= 0:
+        raise AxPanic(f"{what} must be positive")
+    return n
+
+
 def _list_method(interp, lst: list, name: str, args: list, kwargs: dict) -> Any:
+    call = interp.call_value
     if name == "len":
         return len(lst)
     if name == "is_empty":
@@ -251,37 +406,105 @@ def _list_method(interp, lst: list, name: str, args: list, kwargs: dict) -> Any:
         lst.append(args[0]); return None
     if name == "pop":
         return some(lst.pop()) if lst else NONE
+    if name == "insert":
+        i = int(args[0])
+        if i < 0:
+            i += len(lst)
+        if not 0 <= i <= len(lst):
+            raise AxPanic("index out of range")
+        lst.insert(i, args[1]); return None
+    if name == "remove":
+        return lst.pop(_vec_index(lst, int(args[0])))
+    if name == "clear":
+        lst.clear(); return None
+    if name == "extend":
+        lst.extend(list(args[0])); return None
     if name == "first":
         return some(lst[0]) if lst else NONE
     if name == "last":
         return some(lst[-1]) if lst else NONE
-    if name == "get":
+    if name == "get" or name == "get_mut":
         i = int(args[0])
         return some(lst[i]) if 0 <= i < len(lst) else NONE
     if name == "contains":
-        return args[0] in lst
+        return any(_values_equal(x, args[0]) for x in lst)
+    if name == "index_of":
+        for i, x in enumerate(lst):
+            if _values_equal(x, args[0]):
+                return some(i)
+        return NONE
     if name == "slice":
         return _apply_slice(lst, args[0])
-    if name == "to_vec":
+    if name == "take":
+        return lst[:max(0, int(args[0]))]
+    if name == "skip":
+        return lst[max(0, int(args[0])):]
+    if name in {"to_vec", "collect", "iter", "clone"}:
         return list(lst)
     if name == "reverse":
         return list(reversed(lst))
     if name == "sort":
         return sorted(lst)
-    if name == "map":
-        return [interp.call_value(args[0], [x], {}) for x in lst]
-    if name == "filter":
-        return [x for x in lst if _truthy(interp.call_value(args[0], [x], {}))]
-    if name == "collect":
-        return list(lst)
-    if name == "sum":
-        return sum(lst)
-    if name == "join":
-        return (args[0] if args else "").join(ax_str(x) for x in lst)
     if name == "sort_by":
         import functools
         cmp = args[0]
-        return sorted(lst, key=functools.cmp_to_key(lambda a, b: interp.call_value(cmp, [a, b], {})))
+        return sorted(lst, key=functools.cmp_to_key(lambda a, b: call(cmp, [a, b], {})))
+    if name == "dedup":
+        out: list = []
+        for x in lst:
+            if not out or not _values_equal(out[-1], x):
+                out.append(x)
+        return out
+    if name == "map":
+        return [call(args[0], [x], {}) for x in lst]
+    if name == "filter":
+        return [x for x in lst if _truthy(call(args[0], [x], {}))]
+    if name == "fold":
+        acc = args[0]
+        for x in lst:
+            acc = call(args[1], [acc, x], {})
+        return acc
+    if name == "any":
+        return any(_truthy(call(args[0], [x], {})) for x in lst)
+    if name == "all":
+        return all(_truthy(call(args[0], [x], {})) for x in lst)
+    if name == "count":
+        return sum(1 for x in lst if _truthy(call(args[0], [x], {})))
+    if name == "find":
+        for x in lst:
+            if _truthy(call(args[0], [x], {})):
+                return some(x)
+        return NONE
+    if name == "position":
+        for i, x in enumerate(lst):
+            if _truthy(call(args[0], [x], {})):
+                return some(i)
+        return NONE
+    if name == "for_each":
+        for x in lst:
+            call(args[0], [x], {})
+        return None
+    if name == "enumerate":
+        return [(i, x) for i, x in enumerate(lst)]
+    if name == "zip":
+        return list(zip(lst, args[0]))
+    if name == "windows":
+        n = _positive(args[0], "window size")
+        return [lst[i:i + n] for i in range(len(lst) - n + 1)]
+    if name == "chunks":
+        n = _positive(args[0], "chunk size")
+        return [lst[i:i + n] for i in range(0, len(lst), n)]
+    if name == "min":
+        return some(min(lst)) if lst else NONE
+    if name == "max":
+        return some(max(lst)) if lst else NONE
+    if name == "sum":
+        total = 0.0 if any(isinstance(x, float) for x in lst) else 0
+        for x in lst:
+            total = check_int(total + x)
+        return total
+    if name == "join":
+        return (args[0] if args else "").join(ax_str(x) for x in lst)
     raise AxPanic(f"Vec has no method `{name}`")
 
 
@@ -299,18 +522,21 @@ def _map_method(d: dict, name: str, args: list, kwargs: dict) -> Any:
         if args[0] in d:
             return some(d.pop(args[0]))
         return NONE
+    if name == "clear":
+        d.clear(); return None
     if name == "contains_key":
         return args[0] in d
     if name == "keys":
         return list(d.keys())
     if name == "values":
         return list(d.values())
-    if name == "entries":
+    if name == "entries" or name == "iter":
         return [(k, v) for k, v in d.items()]
     raise AxPanic(f"Map has no method `{name}`")
 
 
 def _option_method(interp, opt: AxOption, name: str, args: list) -> Any:
+    call = interp.call_value
     if name == "is_some":
         return opt.is_some
     if name == "is_none":
@@ -322,17 +548,26 @@ def _option_method(interp, opt: AxOption, name: str, args: list) -> Any:
     if name == "unwrap_or":
         return opt.value if opt.is_some else args[0]
     if name == "unwrap_or_else":
-        return opt.value if opt.is_some else interp.call_value(args[0], [], {})
-    if name == "map":
-        return some(interp.call_value(args[0], [opt.value], {})) if opt.is_some else NONE
+        return opt.value if opt.is_some else call(args[0], [], {})
     if name == "expect":
         if opt.is_some:
             return opt.value
         raise AxPanic(ax_str(args[0]) if args else "expectation failed")
+    if name == "map":
+        return some(call(args[0], [opt.value], {})) if opt.is_some else NONE
+    if name == "and_then":
+        return call(args[0], [opt.value], {}) if opt.is_some else NONE
+    if name == "filter":
+        return opt if opt.is_some and _truthy(call(args[0], [opt.value], {})) else NONE
+    if name == "or":
+        return opt if opt.is_some else args[0]
+    if name == "ok_or":
+        return ok(opt.value) if opt.is_some else err(args[0])
     raise AxPanic(f"Option has no method `{name}`")
 
 
 def _result_method(interp, res: AxResult, name: str, args: list) -> Any:
+    call = interp.call_value
     if name == "is_ok":
         return res.is_ok
     if name == "is_err":
@@ -341,24 +576,40 @@ def _result_method(interp, res: AxResult, name: str, args: list) -> Any:
         if res.is_ok:
             return res.value
         raise AxPanic(f"called unwrap on an Err value: {ax_str(res.value)}")
+    if name == "expect":
+        if res.is_ok:
+            return res.value
+        raise AxPanic(f"{ax_str(args[0])}: {ax_str(res.value)}")
     if name == "unwrap_or":
         return res.value if res.is_ok else args[0]
+    if name == "unwrap_or_else":
+        return res.value if res.is_ok else call(args[0], [res.value], {})
     if name == "unwrap_err":
         if not res.is_ok:
             return res.value
         raise AxPanic("called unwrap_err on an Ok value")
     if name == "ok":
         return some(res.value) if res.is_ok else NONE
+    if name == "err":
+        return NONE if res.is_ok else some(res.value)
     if name == "map":
-        return ok(interp.call_value(args[0], [res.value], {})) if res.is_ok else res
+        return ok(call(args[0], [res.value], {})) if res.is_ok else res
+    if name == "map_err":
+        return res if res.is_ok else err(call(args[0], [res.value], {}))
+    if name == "and_then":
+        return call(args[0], [res.value], {}) if res.is_ok else res
     raise AxPanic(f"Result has no method `{name}`")
 
 
 def _apply_slice(seq, index):
     if isinstance(index, AxRange):
         stop = index.end + 1 if index.inclusive else index.end
+        if isinstance(seq, str):
+            return _byte_slice(seq, index.start, stop)
         return seq[index.start:stop]
-    return seq[index]
+    if isinstance(seq, str):
+        return _byte_index(seq, int(index))
+    return seq[_vec_index(seq, int(index))]
 
 
 # --------------------------------------------------------------------------- #
@@ -372,6 +623,8 @@ def builtin_static(interp, ty: AxType, name: str, args: list, kwargs: dict) -> A
         return _json_static(interp, name, args, kwargs)
     if n == "File":
         return _file_static(name, args)
+    if n == "Process":
+        return _process_static(interp, name, args)
     if n == "HttpClient":
         if name == "new":
             return HttpClient()
@@ -400,14 +653,30 @@ def builtin_static_field(interp, ty: AxType, name: str) -> Any:
 
 def _math_static(name: str, args: list) -> Any:
     fns = {
-        "sqrt": math.sqrt, "abs": abs, "floor": math.floor, "ceil": math.ceil,
-        "sin": math.sin, "cos": math.cos, "tan": math.tan, "log": math.log,
-        "exp": math.exp, "pow": lambda b, e: b ** e,
-        "max": max, "min": min, "round": round,
+        "sqrt": lambda x: math.sqrt(x) if x >= 0 else math.nan,
+        "abs": lambda x: check_int(abs(x)),
+        "floor": lambda x: check_int(math.floor(x)),
+        "ceil": lambda x: check_int(math.ceil(x)),
+        "sin": math.sin, "cos": math.cos, "tan": math.tan,
+        "log": lambda x: math.log(x) if x > 0 else (-math.inf if x == 0 else math.nan),
+        "exp": math.exp, "pow": lambda b, e: math.pow(b, e),
+        "max": max, "min": min, "round": _round_half_away,
     }
     if name in fns:
         return fns[name](*args)
     raise AxPanic(f"Math has no member `{name}`")
+
+
+def _process_static(interp, name: str, args: list) -> Any:
+    if name == "args":
+        return list(interp.argv)
+    if name == "exit":
+        sys.stdout.flush()
+        raise AxExit(int(args[0]) if args else 0)
+    if name == "env":
+        value = os.environ.get(args[0])
+        return some(value) if value is not None else NONE
+    raise AxPanic(f"Process has no member `{name}`")
 
 
 def _json_static(interp, name: str, args: list, kwargs: dict) -> Any:

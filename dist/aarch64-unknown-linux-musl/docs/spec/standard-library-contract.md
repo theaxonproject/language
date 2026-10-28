@@ -89,6 +89,37 @@ The collections module must provide:
 `sort_by`, `reverse`, `dedup`, `extend`, `slice`, `first`, `last`, `windows`,
 and `chunks`.
 
+The 1.2 implementation provides all of these, in both the interpreter and
+native executables, plus `any`, `all`, `count`, `find`, `position`,
+`for_each`, `index_of`, `take`, `skip`, `enumerate`, `zip`, `min`, `max`,
+`sum`, `join`, and `clone`. Methods that take a closure (`map`, `filter`,
+`fold`, `sort_by`, ...) accept `x => ...`, `(a, b) => ...`, or a named
+function. `sort` and `sort_by` are stable. Mutating methods require a
+`let mut` binding.
+
+`Map(K, V)` provides `get`, `insert`, `remove`, `contains_key`, `keys`,
+`values`, `entries`, `clear`, `len`, and `is_empty`, preserves insertion order,
+and iterates as `(key, value)` tuples: `for (k, v) in map do`.
+
+`Option(T)` provides `is_some`, `is_none`, `unwrap`, `expect`, `unwrap_or`,
+`unwrap_or_else`, `map`, `and_then`, `filter`, `or`, and `ok_or`.
+`Result(T, E)` provides `is_ok`, `is_err`, `unwrap`, `expect`, `unwrap_err`,
+`unwrap_or`, `unwrap_or_else`, `ok`, `err`, `map`, `map_err`, and `and_then`.
+
+`str` provides `len` (bytes), `is_empty`, `chars`, `bytes`, `lines`,
+`split`, `split_once`, `trim`, `trim_start`, `trim_end`, `to_upper`,
+`to_lower`, `contains`, `starts_with`, `ends_with`, `strip_prefix`,
+`strip_suffix`, `find`, `replace`, `repeat`, `compare`, `slice`, and
+`parse(T)`.
+
+## Process Required Surface
+
+```axon
+fn Process.args() -> Vec(str)          ## program arguments, without the program name
+fn Process.env(name: str) -> str?      ## an environment variable
+fn Process.exit(code: int) -> never    ## flush stdout and exit with `code`
+```
+
 ## I/O Required Types
 
 The I/O module must provide `File`, `Dir`, `Path`, `Stdin`, `Stdout`, `Stderr`,
@@ -114,6 +145,19 @@ CSV, and MessagePack are required formats. `@derive(Serialize, Deserialize)` and
 
 `axstd.test` provides `@test`, `@bench`, `expect`, `@skip`, `@only`, and
 `@timeout`. Examples in documentation are compiled and run as tests.
+
+The 1.2 toolchain implements `@test` and `@skip`: `axc test [paths]` and
+`axbuild test` run every `@test` function. A test passes when it returns
+normally (or returns `Ok`) and fails on a panic, a failed assertion, or an
+`Err` result.
+
+```axon
+@test
+fn parses_numbers() -> int!str
+    let n = try "42".parse(int)
+    assert_eq(n, 42)
+    return Ok(n)
+```
 
 `axstd.proptest` provides `@property_test`, shrinking, custom generators through
 `Generate`, and stateful model testing.

@@ -27,9 +27,12 @@ in dependency order.
 
 from __future__ import annotations
 
+import copy
 import pathlib
+import re
 
 from . import ast
+from .stdlib import BUILTIN_FUNCTIONS
 from .errors import Diagnostic
 
 _INT_TYPES = {
@@ -45,7 +48,7 @@ def unsupported(message: str, span=None) -> Diagnostic:
     return Diagnostic(
         "E800", message, span,
         "this construct is not yet supported by the native backend; "
-        "run the program with `axc run` instead",
+        "run the program with `axc run --interpret` instead",
     )
 
 
@@ -54,6 +57,9 @@ def mangle(tag) -> str:
     if isinstance(tag, str):
         return tag
     kind = tag[0]
+    if kind in {"fn", "tup"}:
+        # variable arity: encode it so nested signatures cannot collide
+        kind = f"{kind}{len(tag) - 1}"
     return kind + "_" + "_".join(mangle(t) for t in tag[1:])
 
 
@@ -78,14 +84,27 @@ class Writer:
 class FnContext:
     def __init__(self, self_type=None, self_ptr: bool = False, ret_tag="void") -> None:
         self.var_types: dict[str, object] = {}
+        self.mut_vars: set[str] = set()
         self.self_type = self_type
         self.self_ptr = self_ptr
         self.ret_tag = ret_tag
+        # block-scoped `defer`: one list of deferred expressions per open
+        # block, plus the scope depth at which each enclosing loop body starts
+        self.defer_scopes: list[list[ast.Node]] = []
+        self.loop_marks: list[int] = []
         self._tmp = 0
 
     def tmp(self) -> str:
         self._tmp += 1
         return f"__ax{self._tmp}"
+
+    def has_defers(self, start: int = 0) -> bool:
+        return any(self.defer_scopes[start:])
+
+
+_LITERAL_RE = re.compile(
+    r'^(-?\d+(\.\d+)?([eE][-+]?\d+)?|INT64_C\(-?\d+\)|true|false|'
+    r'ax_str_lit\("([^"\\]|\\.)*"\))$')
 
 
 class CBackend:
@@ -103,6 +122,17 @@ class CBackend:
         self.type_defs: list[str] = []
         self._ensured: set = set()
         self._shows: dict = {}
+        # closures and function references, emitted after the prototypes
+        self.lambda_defs: list[str] = []
+        self._lambda_count = 0
+        self._fnrefs: set[str] = set()
+        self._helpers: set = set()
+        # generic functions: type-parameter bindings in scope while emitting a
+        # specialization, plus the specializations requested so far
+        self._tenv: dict[str, object] = {}
+        self._specs: dict[tuple, str] = {}
+        self._pending_specs: list[tuple] = []
+        self.spec_protos: list[str] = []
         self._collect()
 
     def _collect(self) -> None:
@@ -121,6 +151,14 @@ class CBackend:
                     table[m.name] = m
             elif isinstance(item, ast.Const):
                 self.consts[item.name] = item
+        # trait default methods are compiled for every implementing type
+        defaults = {item.name: [m for m in item.methods if m.body is not None]
+                    for item in self.module.items if isinstance(item, ast.TraitDef)}
+        for item in self.module.items:
+            if isinstance(item, ast.ImplBlock) and item.trait_name in defaults:
+                table = self.methods.setdefault(item.type_name, {})
+                for m in defaults[item.trait_name]:
+                    table.setdefault(m.name, m)
 
     # -- type machinery -------------------------------------------------------
     def type_tag(self, node: ast.Node | None):
@@ -128,6 +166,8 @@ class CBackend:
             return "void"
         if isinstance(node, ast.TypeName):
             n = node.name
+            if n in self._tenv and not node.args:
+                return self._tenv[n]
             if n in _INT_TYPES:
                 return "int"
             if n in _FLOAT_TYPES:
@@ -162,6 +202,13 @@ class CBackend:
             return ("vec", self.type_tag(node.elem))
         if isinstance(node, ast.ArrayType):
             return ("vec", self.type_tag(node.elem))
+        if isinstance(node, ast.TupleType):
+            if not node.elems:
+                return "void"
+            return ("tup", *[self.type_tag(e) for e in node.elems])
+        if isinstance(node, ast.FnType):
+            ret = self.type_tag(node.ret) if node.ret is not None else "void"
+            return ("fn", ret, *[self.type_tag(p) for p in node.params])
         raise unsupported("native backend does not support this type form",
                           getattr(node, "span", None))
 
@@ -188,6 +235,8 @@ class CBackend:
             return f"AxVec_{mangle(tag[1])}"
         if kind == "map":
             return f"AxMap_{mangle(tag[1])}"
+        if kind in {"tup", "fn"}:
+            return f"AxT_{mangle(tag)}"
         raise unsupported(f"native backend has no representation for `{tag}`")
 
     # -- monomorphization -------------------------------------------------------
@@ -222,6 +271,20 @@ class CBackend:
             self.ensure(("vec", "str"))
             self.ensure(("vec", tag[1]))
             self._emit_map_def(tag)
+        elif kind == "tup":
+            for t in tag[1:]:
+                self.ensure(t)
+            fields = " ".join(f"{self.ctype(t)} f{i};" for i, t in enumerate(tag[1:]))
+            self.type_defs.append(f"typedef struct {{ {fields} }} {self.ctype(tag)};")
+        elif kind == "fn":
+            # a closure value: environment pointer + code pointer
+            for t in tag[1:]:
+                if t != "void":
+                    self.ensure(t)
+            params = ", ".join(["void *", *[self.ctype(t) for t in tag[2:]]])
+            self.type_defs.append(
+                f"typedef struct {{ void *env; {self.ctype(tag[1])} (*call)({params}); }} "
+                f"{self.ctype(tag)};")
 
     def _emit_struct_def(self, sdef: ast.StructDef) -> None:
         if sdef.generics:
@@ -235,7 +298,7 @@ class CBackend:
             tag = self.type_tag(f.type)
             self.ensure(tag)
             tags[f.name] = tag
-            fields.append(f"    {self.ctype(tag)} {f.name};")
+            fields.append(f"    {self.ctype(tag)} {cfield(f.name)};")
         self.struct_fields[sdef.name] = tags
         body = "\n".join(fields)
         self.type_defs.append(
@@ -274,7 +337,7 @@ class CBackend:
             for i, (fname, ftype) in enumerate(v.payload):
                 ftag = self.type_tag(ftype)
                 self.ensure(ftag)
-                cname = fname or f"f{i}"
+                cname = cfield(fname) if fname else f"f{i}"
                 fields.append(f"        {self.ctype(ftag)} {cname};")
                 params.append(f"{self.ctype(ftag)} {cname}")
                 assigns.append(f"    e.as_.{v.name}.{cname} = {cname};")
@@ -361,6 +424,17 @@ class CBackend:
             f"    {c} out = ax_vec_new_{s}();\n"
             f"    for (int64_t i = v.len - 1; i >= 0; i--) ax_vec_push_{s}(&out, v.data[i]);\n"
             f"    return out;\n}}",
+            f"static void ax_vec_insert_{s}({c} *v, int64_t i, {t} x) {{\n"
+            f"    if (i < 0) i += v->len;\n"
+            f"    if (i < 0 || i > v->len) ax_panic(ax_str_lit(\"index out of range\"));\n"
+            f"    ax_vec_push_{s}(v, x);\n"
+            f"    memmove(v->data + i + 1, v->data + i, (size_t)(v->len - 1 - i) * sizeof({t}));\n"
+            f"    v->data[i] = x;\n}}",
+            f"static {t} ax_vec_remove_{s}({c} *v, int64_t i) {{\n"
+            f"    i = ax_vec_idx_{s}(*v, i);\n"
+            f"    {t} x = v->data[i];\n"
+            f"    memmove(v->data + i, v->data + i + 1, (size_t)(v->len - 1 - i) * sizeof({t}));\n"
+            f"    v->len--;\n    return x;\n}}",
             f"static {c} ax_vec_slice_{s}({c} v, int64_t start, int64_t end) {{\n"
             f"    if (start < 0) start += v.len;\n    if (end < 0) end += v.len;\n"
             f"    if (start < 0) start = 0;\n    if (end > v.len) end = v.len;\n"
@@ -376,10 +450,11 @@ class CBackend:
                 f"    return false;\n}}"
             )
         if elem in {"int", "float"}:
+            add = "ax_iadd(acc, v.data[i])" if elem == "int" else "acc + v.data[i]"
             parts.append(
                 f"static {t} ax_vec_sum_{s}({c} v) {{\n"
                 f"    {t} acc = 0;\n"
-                f"    for (int64_t i = 0; i < v.len; i++) acc += v.data[i];\n"
+                f"    for (int64_t i = 0; i < v.len; i++) acc = {add};\n"
                 f"    return acc;\n}}"
             )
         if elem in {"int", "float", "str"}:
@@ -495,6 +570,16 @@ class CBackend:
         if isinstance(tag, tuple) and tag[0] == "enum" and \
                 not self._enum_has_payload(self.enums[tag[1]]):
             return lambda a, b: f"({a} == {b})"
+        if isinstance(tag, tuple) and tag[0] == "tup":
+            parts = [self._eq_fn(t) for t in tag[1:]]
+            if all(p is not None for p in parts):
+                return lambda a, b: "(" + " && ".join(
+                    p(f"({a}).f{i}", f"({b}).f{i}") for i, p in enumerate(parts)) + ")"
+        if isinstance(tag, tuple) and tag[0] == "opt":
+            inner = self._eq_fn(tag[1])
+            if inner is not None:
+                return lambda a, b: (f"(({a}).has == ({b}).has && (!({a}).has || "
+                                     f"{inner(f'({a}).val', f'({b}).val')}))")
         return None
 
     # -- show (to-string) functions --------------------------------------------
@@ -525,7 +610,7 @@ class CBackend:
                 inner_show = self.ensure_show(ftag)
                 sep = "" if first else ", "
                 w.line(f'out = ax_str_concat(out, ax_str_lit("{sep}{fname}: "));')
-                w.line(f"out = ax_str_concat(out, {inner_show}(v.{fname}));")
+                w.line(f"out = ax_str_concat(out, {inner_show}(v.{cfield(fname)}));")
                 first = False
             w.line('return ax_str_concat(out, ax_str_lit(" }"));')
             w.dedent()
@@ -545,7 +630,7 @@ class CBackend:
                 else:
                     w.line(f'AxStr out = ax_str_lit("{v.name}(");')
                     for i, (fname, ftype) in enumerate(v.payload):
-                        cname = fname or f"f{i}"
+                        cname = cfield(fname) if fname else f"f{i}"
                         inner_show = self.ensure_show(self.type_tag(ftype))
                         if i:
                             w.line('out = ax_str_concat(out, ax_str_lit(", "));')
@@ -586,6 +671,18 @@ class CBackend:
             w.dedent()
             w.line("}")
             w.line('return ax_str_concat(out, ax_str_lit("]"));')
+            w.dedent()
+            w.line("}")
+        elif tag[0] == "tup":
+            w.line(f"static AxStr {name}({c} v) {{")
+            w.indent()
+            w.line('AxStr out = ax_str_lit("(");')
+            for i, t in enumerate(tag[1:]):
+                inner_show = self.ensure_show(t)
+                if i:
+                    w.line('out = ax_str_concat(out, ax_str_lit(", "));')
+                w.line(f"out = ax_str_concat(out, {inner_show}(v.f{i}));")
+            w.line('return ax_str_concat(out, ax_str_lit(")"));')
             w.dedent()
             w.line("}")
         elif tag[0] == "map":
@@ -640,15 +737,26 @@ class CBackend:
         protos = Writer()
         bodies = Writer()
         for fn in self.functions.values():
-            protos.line(self._prototype(fn) + ";")
+            if not fn.generics:
+                protos.line(self._prototype(fn) + ";")
         for owner, table in self.methods.items():
             for m in table.values():
                 protos.line(self._prototype(m, owner) + ";")
         for fn in self.functions.values():
-            self._emit_fn(bodies, fn)
+            if not fn.generics:
+                self._emit_fn(bodies, fn)
         for owner, table in self.methods.items():
             for m in table.values():
                 self._emit_fn(bodies, m, owner)
+        # generic specializations requested by the bodies (and by each other)
+        while self._pending_specs:
+            fn, bindings, cname = self._pending_specs.pop(0)
+            saved = self._tenv
+            self._tenv = dict(bindings)
+            try:
+                self._emit_fn(bodies, fn, None, cname)
+            finally:
+                self._tenv = saved
 
         main_w = Writer()
         self._emit_c_main(main_w)
@@ -665,7 +773,13 @@ class CBackend:
         out.line()
         out.line("/* ---- prototypes ---- */")
         out.parts.extend(protos.parts)
+        out.parts.extend(self.spec_protos)
         out.line()
+        if self.lambda_defs:
+            out.line("/* ---- closures ---- */")
+            for block in self.lambda_defs:
+                out.parts.append(block)
+                out.line()
         out.parts.extend(init_w.parts)
         out.line()
         out.line("/* ---- program ---- */")
@@ -674,6 +788,10 @@ class CBackend:
         return out.text()
 
     def _cname(self, fn: ast.FnDef, owner: str | None) -> str:
+        if fn.generics and owner is None and self._tenv:
+            key = (fn.name, tuple(sorted(self._tenv.items(), key=lambda kv: kv[0])))
+            if key in self._specs:
+                return self._specs[key]
         if owner is not None:
             return f"{owner}__{fn.name}"
         if fn.name == "main":
@@ -702,8 +820,9 @@ class CBackend:
         param_str = ", ".join(params) if params else "void"
         return f"{ret} {self._cname(fn, owner)}({param_str})"
 
-    def _emit_fn(self, w: Writer, fn: ast.FnDef, owner: str | None = None) -> None:
-        if fn.generics:
+    def _emit_fn(self, w: Writer, fn: ast.FnDef, owner: str | None = None,
+                 spec_name: str | None = None) -> None:
+        if fn.generics and spec_name is None:
             raise unsupported(f"native backend does not support generic fn `{fn.name}`", fn.span)
         if fn.body is None:
             return
@@ -716,6 +835,8 @@ class CBackend:
             rest = rest[1:]
         for p in rest:
             ctx.var_types[p.name] = self.type_tag(p.type)
+            if p.is_mut:
+                ctx.mut_vars.add(p.name)
         w.line(self._prototype(fn, owner) + " {")
         w.indent()
         self._emit_block(w, fn.body, ctx)
@@ -730,7 +851,7 @@ class CBackend:
         ret_tag = self.type_tag(main.return_type)
         w.line("int main(int argc, char **argv) {")
         w.indent()
-        w.line("(void)argc; (void)argv;")
+        w.line("ax_argc = argc; ax_argv = argv;")
         w.line("ax_init_consts();")
         if ret_tag == "int":
             w.line("return (int)axon_user_main();")
@@ -742,8 +863,55 @@ class CBackend:
 
     # -- statements -----------------------------------------------------------
     def _emit_block(self, w: Writer, block: ast.Block, ctx: FnContext) -> None:
+        ctx.defer_scopes.append([])
         for stmt in block.stmts:
             self._emit_stmt(w, stmt, ctx)
+        scope = ctx.defer_scopes.pop()
+        ends = block.stmts and isinstance(
+            block.stmts[-1], (ast.ReturnStmt, ast.BreakStmt, ast.ContinueStmt))
+        if scope and not ends:
+            for expr in reversed(scope):
+                self._emit_expr_stmt(w, expr, ctx)
+
+    def _emit_loop_body(self, w: Writer, block: ast.Block, ctx: FnContext) -> None:
+        ctx.loop_marks.append(len(ctx.defer_scopes))
+        self._emit_block(w, block, ctx)
+        ctx.loop_marks.pop()
+
+    def _emit_defers(self, w: Writer, ctx: FnContext, start: int = 0) -> None:
+        """Run the deferred expressions of every open scope from `start`
+        inward, innermost first (the order the interpreter unwinds them)."""
+        for scope in reversed(ctx.defer_scopes[start:]):
+            for expr in reversed(scope):
+                self._emit_expr_stmt(w, expr, ctx)
+
+    def _emit_return(self, w: Writer, code: str | None, ctx: FnContext, tag=None) -> None:
+        if not ctx.has_defers():
+            w.line(f"return {code};" if code is not None else "return;")
+            return
+        w.line("{")
+        w.indent()
+        if code is not None:
+            ret = ctx.tmp()
+            rtag = tag if tag is not None else ctx.ret_tag
+            w.line(f"{self.ctype(rtag)} {ret} = {code};")
+        self._emit_defers(w, ctx)
+        w.line(f"return {ret};" if code is not None else "return;")
+        w.dedent()
+        w.line("}")
+
+    def _bind_pattern(self, w: Writer, pat: ast.Node, scr: str, tag, ctx: FnContext,
+                      what: str, mutable: bool = False) -> None:
+        """Destructure `scr` with an (expected irrefutable) pattern."""
+        test, bindings = self._pattern_test(pat, scr, tag, ctx)
+        if test != "true":
+            w.line(f'if (!({test})) ax_panic(ax_str_lit("{what} pattern did not match"));')
+        for name, btag, bcode in bindings:
+            self.ensure(btag)
+            ctx.var_types[name] = btag
+            if mutable:
+                ctx.mut_vars.add(name)
+            w.line(f"{self.ctype(btag)} {name} = {bcode};")
 
     def _emit_stmt(self, w: Writer, stmt: ast.Node, ctx: FnContext) -> None:
         k = type(stmt)
@@ -753,10 +921,14 @@ class CBackend:
             self._emit_assign(w, stmt, ctx)
         elif k is ast.ReturnStmt:
             if stmt.value is None:
-                w.line("return;")
+                self._emit_return(w, None, ctx)
             else:
-                code, _ = self._emit_expr(stmt.value, ctx, w, expect=ctx.ret_tag)
-                w.line(f"return {code};")
+                code, tag = self._emit_expr(stmt.value, ctx, w, expect=ctx.ret_tag)
+                self._emit_return(w, code, ctx, ctx.ret_tag if ctx.ret_tag is not None else tag)
+        elif k is ast.DeferStmt:
+            if not ctx.defer_scopes:
+                raise unsupported("`defer` outside of a block", stmt.span)
+            ctx.defer_scopes[-1].append(stmt.expr)
         elif k is ast.ExprStmt:
             self._emit_expr_stmt(w, stmt.expr, ctx)
         elif k is ast.IfStmt:
@@ -775,26 +947,49 @@ class CBackend:
                 for p in pre.parts:
                     w.line(p)
                 w.line(f"if (!({self._truthy(cond, ctag)})) break;")
-                self._emit_block(w, stmt.body, ctx)
+                self._emit_loop_body(w, stmt.body, ctx)
                 w.dedent()
                 w.line("}")
             else:
                 w.line(f"while ({self._truthy(cond, ctag)}) {{")
-                w.indent(); self._emit_block(w, stmt.body, ctx); w.dedent()
+                w.indent(); self._emit_loop_body(w, stmt.body, ctx); w.dedent()
                 w.line("}")
         elif k is ast.LoopStmt:
             w.line("while (1) {")
-            w.indent(); self._emit_block(w, stmt.body, ctx); w.dedent()
+            w.indent(); self._emit_loop_body(w, stmt.body, ctx); w.dedent()
             w.line("}")
-        elif k is ast.BreakStmt:
-            w.line("break;")
-        elif k is ast.ContinueStmt:
-            w.line("continue;")
+        elif k is ast.BreakStmt or k is ast.ContinueStmt:
+            if ctx.loop_marks and ctx.has_defers(ctx.loop_marks[-1]):
+                self._emit_defers(w, ctx, ctx.loop_marks[-1])
+            w.line("break;" if k is ast.BreakStmt else "continue;")
         else:
             raise unsupported(
                 f"native backend does not support `{k.__name__}` yet",
                 getattr(stmt, "span", None),
             )
+
+    def _sequence(self, items: list, ctx: FnContext, w: Writer) -> list[str]:
+        """Fix the evaluation order of sibling operands.
+
+        C leaves the order of function arguments and operator operands
+        unspecified, but AXON evaluates left to right. When an operand other
+        than the last does real work (contains a call), every non-trivial
+        operand except the last is bound to a temporary first. `items` holds
+        (code, tag) pairs; the returned codes are safe to combine.
+        """
+        if not any("(" in c and not _LITERAL_RE.match(c) for c, _ in items[:-1]):
+            return [c for c, _ in items]  # nothing before the last operand does work
+        out = []
+        for i, (code, tag) in enumerate(items):
+            if i == len(items) - 1 or _LITERAL_RE.match(code) or tag == "void" \
+                    or re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", code):
+                out.append(code)
+                continue
+            tmp = ctx.tmp()
+            self.ensure(tag)
+            w.line(f"{self.ctype(tag)} {tmp} = {code};")
+            out.append(tmp)
+        return out
 
     def _truthy(self, code: str, tag) -> str:
         if tag == "bool":
@@ -817,9 +1012,19 @@ class CBackend:
             tag = self.type_tag(stmt.type) if stmt.type is not None else "int"
             self.ensure(tag)
             ctx.var_types[stmt.name] = tag
+            ctx.mut_vars.add(stmt.name)  # initialized later by assignment
             w.line(f"{self.ctype(tag)} {stmt.name};")
             w.line(f"memset(&{stmt.name}, 0, sizeof({stmt.name}));")
             return
+        if stmt.pattern is not None:
+            code, tag = self._emit_expr(stmt.value, ctx, w)
+            self.ensure(tag)
+            tmp = ctx.tmp()
+            w.line(f"{self.ctype(tag)} {tmp} = {code};")
+            self._bind_pattern(w, stmt.pattern, tmp, tag, ctx, "let", stmt.is_mut)
+            return
+        if stmt.is_mut:
+            ctx.mut_vars.add(stmt.name)
         expect = self.type_tag(stmt.type) if stmt.type is not None else None
         code, tag = self._emit_expr(stmt.value, ctx, w, expect=expect)
         if expect is not None:
@@ -874,10 +1079,8 @@ class CBackend:
         op = stmt.op[:-1]
         if op == "+" and ttag == "str":
             w.line(f"{tcode} = ax_str_concat({tcode}, {value});")
-        elif op == "/" and ttag == "int":
-            w.line(f"{tcode} = ax_idiv({tcode}, {value});")
-        elif op == "%" and ttag == "int":
-            w.line(f"{tcode} = ax_imod({tcode}, {value});")
+        elif ttag in {"int", "float"}:
+            w.line(f"{tcode} = {self._arith(op, tcode, value, ttag)};")
         else:
             w.line(f"{tcode} = {tcode} {op} {value};")
 
@@ -899,7 +1102,7 @@ class CBackend:
                 if op == "+" and rtag[1] == "str":
                     w.line(f"{cur} = ax_str_concat({cur}, {value});")
                 else:
-                    w.line(f"{cur} = {cur} {op} {value};")
+                    w.line(f"{cur} = {self._arith(op, cur, value, rtag[1])};")
             return
         if isinstance(rtag, tuple) and rtag[0] == "map":
             s = mangle(rtag[1])
@@ -911,7 +1114,11 @@ class CBackend:
                 op = stmt.op[:-1]
                 cur = f"ax_map_index_{s}({recv}, {key})"
                 value, _ = self._emit_expr(stmt.value, ctx, w, expect=rtag[1])
-                w.line(f"ax_map_insert_{s}(&({recv}), {key}, {cur} {op} {value});")
+                if op == "+" and rtag[1] == "str":
+                    new = f"ax_str_concat({cur}, {value})"
+                else:
+                    new = self._arith(op, cur, value, rtag[1])
+                w.line(f"ax_map_insert_{s}(&({recv}), {key}, {new});")
             return
         raise unsupported("invalid assignment target for the native backend", stmt.span)
 
@@ -977,33 +1184,37 @@ class CBackend:
             cmp = "<=" if rng.inclusive else "<"
             ctx.var_types[var] = "int"
             w.line(f"for (int64_t {var} = {start}; {var} {cmp} {end_tmp}; {var}++) {{")
-            w.indent(); self._emit_block(w, stmt.body, ctx); w.dedent()
+            w.indent(); self._emit_loop_body(w, stmt.body, ctx); w.dedent()
             w.line("}")
             return
         code, tag = self._emit_expr(stmt.iterable, ctx, w)
-        if isinstance(tag, tuple) and tag[0] == "vec":
-            if not isinstance(stmt.pattern, ast.BindingPattern) and \
-                    not isinstance(stmt.pattern, ast.WildcardPattern):
-                raise unsupported(
-                    "native `for` over a Vec supports a simple binding only",
-                    stmt.span,
-                )
-            vec_tmp = ctx.tmp()
-            idx = ctx.tmp()
+        if tag == "str":
+            self.ensure(("vec", "str"))
+            code, tag = f"ax_str_chars({code})", ("vec", "str")
+        if isinstance(tag, tuple) and tag[0] in {"vec", "map"}:
+            coll, idx = ctx.tmp(), ctx.tmp()
             self.ensure(tag)
-            w.line(f"{self.ctype(tag)} {vec_tmp} = {code};")
-            w.line(f"for (int64_t {idx} = 0; {idx} < {vec_tmp}.len; {idx}++) {{")
-            w.indent()
-            if isinstance(stmt.pattern, ast.BindingPattern):
-                var = stmt.pattern.name
-                ctx.var_types[var] = tag[1]
-                w.line(f"{self.ctype(tag[1])} {var} = {vec_tmp}.data[{idx}];")
-            self._emit_block(w, stmt.body, ctx)
+            w.line(f"{self.ctype(tag)} {coll} = {code};")
+            if tag[0] == "vec":
+                elem_tag = tag[1]
+                w.line(f"for (int64_t {idx} = 0; {idx} < {coll}.len; {idx}++) {{")
+                w.indent()
+                elem = f"{coll}.data[{idx}]"
+            else:
+                elem_tag = ("tup", "str", tag[1])
+                self.ensure(elem_tag)
+                w.line(f"for (int64_t {idx} = 0; {idx} < {coll}.keys.len; {idx}++) {{")
+                w.indent()
+                elem = ctx.tmp()
+                w.line(f"{self.ctype(elem_tag)} {elem} = (({self.ctype(elem_tag)})"
+                       f"{{ {coll}.keys.data[{idx}], {coll}.vals.data[{idx}] }});")
+            self._bind_pattern(w, stmt.pattern, elem, elem_tag, ctx, "for")
+            self._emit_loop_body(w, stmt.body, ctx)
             w.dedent()
             w.line("}")
             return
         raise unsupported(
-            "native `for` supports ranges and Vec values", stmt.span,
+            "native `for` supports ranges, Vec, Map, and str values", stmt.span,
         )
 
     def _emit_expr_stmt(self, w: Writer, expr: ast.Node, ctx: FnContext) -> None:
@@ -1063,7 +1274,8 @@ class CBackend:
         if not args:
             w.line(f'{fn}(ax_str_lit(""));')
             return
-        pieces = [self._to_str(w, *self._emit_expr(a.value, ctx, w)) for a in args]
+        pieces = self._sequence(
+            [(self._to_str(w, *self._emit_expr(a.value, ctx, w)), "str") for a in args], ctx, w)
         acc = pieces[0]
         for p in pieces[1:]:
             acc = f'ax_str_concat(ax_str_concat({acc}, ax_str_lit(" ")), {p})'
@@ -1116,6 +1328,7 @@ class CBackend:
     def _emit_arm_body(self, w: Writer, body: ast.Block, ctx: FnContext,
                        result_var, result_tag) -> None:
         stmts = body.stmts
+        ctx.defer_scopes.append([])
         for i, stmt in enumerate(stmts):
             last = i == len(stmts) - 1
             if last and result_var is not None and isinstance(stmt, ast.ExprStmt):
@@ -1123,6 +1336,8 @@ class CBackend:
                 w.line(f"{result_var} = {code};")
             else:
                 self._emit_stmt(w, stmt, ctx)
+        for expr in reversed(ctx.defer_scopes.pop()):
+            self._emit_expr_stmt(w, expr, ctx)
 
     def _match_value_tag(self, node: ast.MatchExpr, scr: str, stag,
                          ctx: FnContext):
@@ -1168,6 +1383,18 @@ class CBackend:
             return " || ".join(tests), []
         if k is ast.VariantPattern:
             return self._variant_test(pat, scr, tag, ctx)
+        if k is ast.TuplePattern:
+            if not (isinstance(tag, tuple) and tag[0] == "tup"
+                    and len(tag) - 1 == len(pat.elems)):
+                raise unsupported(f"tuple pattern cannot match `{tag}` natively", pat.span)
+            tests: list[str] = []
+            binds: list = []
+            for i, sub in enumerate(pat.elems):
+                t, b = self._pattern_test(sub, f"{scr}.f{i}", tag[i + 1], ctx)
+                if t != "true":
+                    tests.append(f"({t})")
+                binds.extend(b)
+            return (" && ".join(tests) if tests else "true"), binds
         raise unsupported(
             f"native match does not support `{k.__name__}` patterns",
             getattr(pat, "span", None),
@@ -1220,7 +1447,7 @@ class CBackend:
                     raise unsupported(
                         f"variant `{name}` has no payload slot {slot}", pat.span)
                 pname, ptype = vdef.payload[slot]
-                cname = pname or f"f{slot}"
+                cname = cfield(pname) if pname else f"f{slot}"
                 ptag = self.type_tag(ptype)
                 sub_test, sub_binds = self._pattern_test(
                     sub, f"{scr}.as_.{name}.{cname}", ptag, ctx)
@@ -1283,10 +1510,15 @@ class CBackend:
         if k is ast.ArrayRepeat:
             return self._emit_array_repeat(node, ctx, w, expect)
         if k is ast.IfExpr:
-            cond, ctag = self._emit_expr(node.cond, ctx, w)
-            then, t = self._emit_expr(node.then, ctx, w, expect)
-            els, _ = self._emit_expr(node.els, ctx, w, expect or t)
-            return f"({self._truthy(cond, ctag)} ? {then} : {els})", t
+            return self._emit_if_expr(node, ctx, w, expect)
+        if k is ast.TupleLit:
+            return self._emit_tuple(node, ctx, w, expect)
+        if k is ast.LambdaExpr:
+            return self._emit_lambda(node, ctx, w, expect)
+        if k is ast.PipeExpr:
+            return self._emit_expr(self._desugar_pipe(node), ctx, w, expect)
+        if k is ast.OptFieldExpr:
+            return self._emit_opt_chain(node, None, ctx, w)
         if k is ast.MatchExpr:
             result_var, result_tag = self._emit_match(w, node, ctx, want_value=True)
             return result_var, result_tag
@@ -1321,10 +1553,34 @@ class CBackend:
             if self._enum_has_payload(edef):
                 return f"{owner}_mk_{name}()", tag
             return f"{owner}__{name}", tag
+        if name in self.functions:
+            return self._emit_fn_ref(self.functions[name], node.span)
         raise unsupported(
             f"native backend cannot resolve `{name}`",
             node.span,
         )
+
+    def _emit_fn_ref(self, fn: ast.FnDef, span):
+        """A named function used as a value: wrap it in a closure trampoline."""
+        if fn.generics:
+            raise unsupported(f"generic fn `{fn.name}` cannot be used as a value natively", span)
+        ptags = []
+        for p in fn.params:
+            if p.type is None:
+                raise unsupported(f"parameter `{p.name}` needs a type annotation", p.span)
+            ptags.append(self.type_tag(p.type))
+        ret = self.type_tag(fn.return_type)
+        tag = ("fn", ret, *ptags)
+        self.ensure(tag)
+        tramp = f"__ax_fnref_{fn.name}"
+        if fn.name not in self._fnrefs:
+            self._fnrefs.add(fn.name)
+            params = ", ".join(["void *env", *[f"{self.ctype(t)} a{i}" for i, t in enumerate(ptags)]])
+            call = f"{self._cname(fn, None)}({', '.join(f'a{i}' for i in range(len(ptags)))})"
+            body = f"{call};" if ret == "void" else f"return {call};"
+            self.lambda_defs.append(
+                f"static {self.ctype(ret)} {tramp}({params}) {{ (void)env; {body} }}")
+        return f"(({self.ctype(tag)}){{ NULL, {tramp} }})", tag
 
     def _emit_binary(self, node: ast.BinaryExpr, ctx: FnContext, w: Writer):
         op = node.op
@@ -1333,24 +1589,25 @@ class CBackend:
             lcode, ltag = self._emit_expr(node.left, ctx, w)
             if isinstance(ltag, tuple) and ltag[0] == "opt":
                 return (f"(!{lcode}.has)" if op == "==" else f"({lcode}.has)"), "bool"
-        if op == "and":
+        if op in {"and", "or"}:
             lcode, ltag = self._emit_expr(node.left, ctx, w)
             pre = Writer()
+            pre.level = w.level + 1
             rcode, rtag = self._emit_expr(node.right, ctx, pre)
-            if pre.parts:
-                raise unsupported(
-                    "native backend cannot short-circuit this operand", node.span)
-            return f"({self._truthy(lcode, ltag)} && {self._truthy(rcode, rtag)})", "bool"
-        if op == "or":
-            lcode, ltag = self._emit_expr(node.left, ctx, w)
-            pre = Writer()
-            rcode, rtag = self._emit_expr(node.right, ctx, pre)
-            if pre.parts:
-                raise unsupported(
-                    "native backend cannot short-circuit this operand", node.span)
-            return f"({self._truthy(lcode, ltag)} || {self._truthy(rcode, rtag)})", "bool"
+            cop = "&&" if op == "and" else "||"
+            if not pre.parts:
+                return f"({self._truthy(lcode, ltag)} {cop} {self._truthy(rcode, rtag)})", "bool"
+            # the right operand needs statements: evaluate it only when needed
+            out = ctx.tmp()
+            w.line(f"bool {out} = {self._truthy(lcode, ltag)};")
+            w.line(f"if ({'' if op == 'and' else '!'}{out}) {{")
+            w.parts.extend(pre.parts)
+            w.line(f"    {out} = {self._truthy(rcode, rtag)};")
+            w.line("}")
+            return out, "bool"
         lcode, ltag = self._emit_expr(node.left, ctx, w)
         rcode, rtag = self._emit_expr(node.right, ctx, w, expect=ltag)
+        lcode, rcode = self._sequence([(lcode, ltag), (rcode, rtag)], ctx, w)
         if op in {"==", "!="} and (ltag == "str" or rtag == "str"):
             base = f"ax_str_eq({lcode}, {rcode})"
             return (base if op == "==" else f"(!{base})"), "bool"
@@ -1369,14 +1626,22 @@ class CBackend:
             return f"ax_str_repeat({lcode}, {rcode})", "str"
         if op in {"==", "!=", "<", "<=", ">", ">="}:
             return f"({lcode} {op} {rcode})", "bool"
+        if op in {"&", "|", "^"} and ltag == "bool" and rtag == "bool":
+            return f"({lcode} {op} {rcode})", "bool"
         result = "float" if "float" in (ltag, rtag) else "int"
-        if op == "/" and result == "int":
-            return f"ax_idiv({lcode}, {rcode})", "int"
-        if op == "%" and result == "int":
-            return f"ax_imod({lcode}, {rcode})", "int"
-        if op in {"<<", ">>", "&", "|", "^"}:
-            return f"({lcode} {op} {rcode})", "int"
-        return f"({lcode} {op} {rcode})", result
+        return self._arith(op, lcode, rcode, result), result
+
+    def _arith(self, op: str, a: str, b: str, tag) -> str:
+        """C expression for an arithmetic/bitwise operator on int or float."""
+        if tag == "float":
+            if op == "%":
+                return f"fmod({a}, {b})"
+            return f"({a} {op} {b})"
+        helper = {"+": "ax_iadd", "-": "ax_isub", "*": "ax_imul", "/": "ax_idiv",
+                  "%": "ax_imod", "<<": "ax_ishl", ">>": "ax_ishr"}.get(op)
+        if helper is not None:
+            return f"{helper}({a}, {b})"
+        return f"({a} {op} {b})"
 
     def _emit_unary(self, node: ast.UnaryExpr, ctx: FnContext, w: Writer):
         code, tag = self._emit_expr(node.operand, ctx, w)
@@ -1384,7 +1649,234 @@ class CBackend:
             return f"(!{self._truthy(code, tag)})", "bool"
         if node.op == "*":
             return code, tag
+        if node.op == "-" and tag == "int":
+            return f"ax_ineg({code})", "int"
         return f"({node.op}{code})", tag
+
+    def _emit_if_expr(self, node: ast.IfExpr, ctx: FnContext, w: Writer, expect):
+        cond, ctag = self._emit_expr(node.cond, ctx, w)
+        tw, ew = Writer(), Writer()
+        tw.level = ew.level = w.level + 1
+        then, t = self._emit_expr(node.then, ctx, tw, expect)
+        if t == "void" and isinstance(node.els, ast.NoneLit):
+            # statement form: `if c then do_something()`
+            w.line(f"if ({self._truthy(cond, ctag)}) {{")
+            w.parts.extend(tw.parts)
+            w.line(f"    {then};")
+            w.line("}")
+            return "((void)0)", "void"
+        els, et = self._emit_expr(node.els, ctx, ew, expect or t)
+        if t == "int" and et == "float":
+            t = "float"
+        if not tw.parts and not ew.parts:
+            return f"({self._truthy(cond, ctag)} ? {then} : {els})", t
+        # a branch needs statements: only the taken branch may run them
+        if t == "void":
+            w.line(f"if ({self._truthy(cond, ctag)}) {{")
+            w.parts.extend(tw.parts)
+            w.line(f"    {then};")
+            w.line("} else {")
+            w.parts.extend(ew.parts)
+            w.line(f"    {els};")
+            w.line("}")
+            return "((void)0)", "void"
+        out = ctx.tmp()
+        self.ensure(t)
+        w.line(f"{self.ctype(t)} {out};")
+        w.line(f"if ({self._truthy(cond, ctag)}) {{")
+        w.parts.extend(tw.parts)
+        w.line(f"    {out} = {then};")
+        w.line("} else {")
+        w.parts.extend(ew.parts)
+        w.line(f"    {out} = {els};")
+        w.line("}")
+        return out, t
+
+    def _emit_tuple(self, node: ast.TupleLit, ctx: FnContext, w: Writer, expect):
+        if not node.elems:
+            return "((void)0)", "void"
+        exp = expect if (isinstance(expect, tuple) and expect[0] == "tup"
+                         and len(expect) == len(node.elems) + 1) else None
+        codes, tags = [], []
+        for i, e in enumerate(node.elems):
+            code, tag = self._emit_expr(e, ctx, w, exp[i + 1] if exp else None)
+            if exp is not None and tag == "int" and exp[i + 1] == "float":
+                tag = "float"
+            codes.append(code)
+            tags.append(tag)
+        tag = ("tup", *tags)
+        self.ensure(tag)
+        codes = self._sequence(list(zip(codes, tags)), ctx, w)
+        return f"(({self.ctype(tag)}){{ {', '.join(codes)} }})", tag
+
+    def _desugar_pipe(self, node: ast.PipeExpr) -> ast.Node:
+        """`x |> f(a)` is `f(x, a)`; `x |> f` is `f(x)`."""
+        left = ast.Arg(node.left.span, None, node.left)
+        right = node.right
+        if isinstance(right, ast.CallExpr):
+            return ast.CallExpr(right.span, right.callee, [left, *right.args])
+        return ast.CallExpr(node.span, right, [left])
+
+    def _emit_opt_chain(self, node: ast.OptFieldExpr, args, ctx: FnContext, w: Writer):
+        """`a?.field` / `a?.method(args)`: none when `a` is none, otherwise the
+        projection wrapped in Some."""
+        rcode, rtag = self._emit_expr(node.recv, ctx, w)
+        self.ensure(rtag)
+        recv = ctx.tmp()
+        w.line(f"{self.ctype(rtag)} {recv} = {rcode};")
+        is_opt = isinstance(rtag, tuple) and rtag[0] == "opt"
+        inner_tag = rtag[1] if is_opt else rtag
+        inner = ctx.tmp()
+        ctx.var_types[inner] = inner_tag
+        body = Writer()
+        body.level = w.level + 1
+        access = ast.FieldExpr(node.span, ast.NameExpr(node.span, inner), node.name)
+        if args is None:
+            vcode, vtag = self._emit_field(access, ctx, body)
+        else:
+            vcode, vtag = self._emit_method_call(access, args, ctx, body, None, node.span)
+        if vtag == "void":
+            raise unsupported("`?.` on a method without a result is not supported natively",
+                              node.span)
+        otag = ("opt", vtag)
+        self.ensure(otag)
+        out = ctx.tmp()
+        w.line(f"{self.ctype(otag)} {out} = ax_opt_none_{mangle(vtag)}();")
+        w.line(f"if ({recv + '.has' if is_opt else 'true'}) {{")
+        val = f"{recv}.val" if is_opt else recv
+        w.line(f"    {self.ctype(inner_tag)} {inner} = {val};")
+        w.parts.extend(body.parts)
+        w.line(f"    {out} = ax_opt_some_{mangle(vtag)}({vcode});")
+        w.line("}")
+        return out, otag
+
+    # -- closures ---------------------------------------------------------------
+    def _free_names(self, node, out: set) -> None:
+        """Every identifier referenced under `node` (an over-approximation of
+        the closure's free variables; non-locals are filtered by the caller)."""
+        if isinstance(node, ast.NameExpr):
+            out.add(node.name)
+            return
+        if isinstance(node, ast.SelfExpr):
+            out.add("self")
+            return
+        if isinstance(node, list):
+            for x in node:
+                self._free_names(x, out)
+            return
+        if isinstance(node, tuple):
+            for x in node:
+                self._free_names(x, out)
+            return
+        if isinstance(node, ast.Node):
+            for f in node.__dataclass_fields__:
+                if f != "span":
+                    self._free_names(getattr(node, f), out)
+
+    def _emit_lambda(self, node: ast.LambdaExpr, ctx: FnContext, w: Writer, expect):
+        exp = expect if (isinstance(expect, tuple) and expect[0] == "fn"
+                         and len(expect) - 2 == len(node.params)) else None
+        ptags = []
+        for i, p in enumerate(node.params):
+            if p.type is not None:
+                ptags.append(self.type_tag(p.type))
+            elif exp is not None and exp[i + 2] is not None:
+                ptags.append(exp[i + 2])
+            else:
+                raise unsupported(
+                    f"closure parameter `{p.name}` needs a type annotation for native "
+                    f"compilation (e.g. `fn({p.name}: int) = ...`)", p.span)
+        declared = self.type_tag(node.ret) if node.ret is not None else (
+            exp[1] if exp is not None and exp[1] is not None else None)
+        params = {p.name for p in node.params}
+        names: set = set()
+        self._free_names(node.body, names)
+        captures = sorted(n for n in names - params
+                          if n in ctx.var_types and n != "self")
+        uses_self = "self" in names and ctx.self_type is not None
+        for n in captures:
+            if n in ctx.mut_vars:
+                raise unsupported(
+                    f"closures that capture the mutable variable `{n}` are not yet "
+                    "supported natively", node.span)
+        self._lambda_count += 1
+        lid = self._lambda_count
+        fname, env_t = f"__ax_lambda{lid}", f"AxEnv{lid}"
+
+        lctx = FnContext(self_type=ctx.self_type if uses_self else None,
+                         self_ptr=False, ret_tag=declared)
+        for n in captures:
+            lctx.var_types[n] = ctx.var_types[n]
+        for p, t in zip(node.params, ptags):
+            lctx.var_types[p.name] = t
+        body = Writer()
+        body.level = 1
+        if isinstance(node.body, ast.Block):
+            raise unsupported("block-bodied closures are not supported natively", node.span)
+        code, rtag = self._emit_expr(node.body, lctx, body, expect=declared)
+        if declared is not None:
+            rtag = declared
+        if rtag == "void" and code == "((void)0)":
+            code = None
+        tag = ("fn", rtag, *ptags)
+        self.ensure(tag)
+
+        fields = [(n, ctx.var_types[n]) for n in captures]
+        if uses_self:
+            fields.append(("self", ctx.self_type))
+        lines = []
+        if fields:
+            decls = " ".join(f"{self.ctype(t)} {n};" for n, t in fields)
+            lines.append(f"typedef struct {{ {decls} }} {env_t};")
+        plist = ", ".join(["void *__env", *[f"{self.ctype(t)} {p.name}"
+                                           for p, t in zip(node.params, ptags)]])
+        lines.append(f"static {self.ctype(rtag)} {fname}({plist}) {{")
+        if fields:
+            lines.append(f"    {env_t} *__e = ({env_t} *)__env;")
+            for n, t in fields:
+                lines.append(f"    {self.ctype(t)} {n} = __e->{n};")
+        else:
+            lines.append("    (void)__env;")
+        lines.extend(body.parts)
+        if code is not None:
+            lines.append(f"    {code};" if rtag == "void" else f"    return {code};")
+        lines.append("}")
+        self.lambda_defs.append("\n".join(lines))
+
+        if not fields:
+            return f"(({self.ctype(tag)}){{ NULL, {fname} }})", tag
+        env = ctx.tmp()
+        w.line(f"{env_t} *{env} = ({env_t} *)ax_alloc(sizeof({env_t}));")
+        for n, _ in fields:
+            if n == "self":
+                w.line(f"{env}->self = {'(*self)' if ctx.self_ptr else 'self'};")
+            else:
+                w.line(f"{env}->{n} = {n};")
+        return f"(({self.ctype(tag)}){{ {env}, {fname} }})", tag
+
+    def _call_closure(self, code: str, tag, args, ctx: FnContext, w: Writer, span):
+        params = tag[2:]
+        if len(args) != len(params):
+            raise unsupported(f"closure expects {len(params)} arguments", span)
+        fn = ctx.tmp()
+        w.line(f"{self.ctype(tag)} {fn} = {code};")
+        codes = self._sequence(
+            [(self._emit_expr(a.value, ctx, w, expect=pt)[0], pt) for a, pt in zip(args, params)],
+            ctx, w)
+        return f"{fn}.call({', '.join([f'{fn}.env', *codes])})", tag[1]
+
+    def _closure_arg(self, arg, ret, params, ctx: FnContext, w: Writer, span, what: str):
+        """Emit a closure argument and bind it to a temporary: (name, fn tag)."""
+        code, tag = self._emit_expr(arg.value, ctx, w, expect=("fn", ret, *params))
+        if not (isinstance(tag, tuple) and tag[0] == "fn" and len(tag) - 2 == len(params)):
+            raise unsupported(f"{what} expects a closure taking {len(params)} argument(s)", span)
+        fn = ctx.tmp()
+        w.line(f"{self.ctype(tag)} {fn} = {code};")
+        return fn, tag
+
+    @staticmethod
+    def _invoke(fn: str, *args: str) -> str:
+        return f"{fn}.call({', '.join([f'{fn}.env', *args])})"
 
     def _emit_try(self, node: ast.TryExpr, ctx: FnContext, w: Writer):
         code, tag = self._emit_expr(node.expr, ctx, w)
@@ -1433,14 +1925,22 @@ class CBackend:
                     "`try` propagation requires the function to return a "
                     "Result with a matching error type", node.span)
             self.ensure(rtag)
-            w.line(f"if (!{ok_test}) return ax_res_err_{mangle(rtag)}({tmp}.err);")
+            w.line(f"if (!{ok_test}) {{")
+            w.indent()
+            self._emit_return(w, f"ax_res_err_{mangle(rtag)}({tmp}.err)", ctx, rtag)
+            w.dedent()
+            w.line("}")
         else:
             if not (isinstance(rtag, tuple) and rtag[0] == "opt"):
                 raise unsupported(
                     "`try` propagation on an Option requires the function to "
                     "return an Option", node.span)
             self.ensure(rtag)
-            w.line(f"if (!{ok_test}) return ax_opt_none_{mangle(rtag[1])}();")
+            w.line(f"if (!{ok_test}) {{")
+            w.indent()
+            self._emit_return(w, f"ax_opt_none_{mangle(rtag[1])}()", ctx, rtag)
+            w.dedent()
+            w.line("}")
         return f"{tmp}.val", val_tag
 
     def _emit_cast(self, node: ast.CastExpr, ctx: FnContext, w: Writer):
@@ -1453,6 +1953,8 @@ class CBackend:
             if n in _INT_TYPES:
                 if tag == "str":
                     raise unsupported("cast str to int natively via `.parse(int)`", node.span)
+                if tag == "float":
+                    return f"ax_f2i({code})", "int"
                 return f"((int64_t)({code}))", "int"
             if n in _FLOAT_TYPES:
                 return f"((double)({code}))", "float"
@@ -1467,27 +1969,31 @@ class CBackend:
         params = fn.params[1:] if (fn.params and fn.params[0].is_self) else fn.params
         by_name = {a.name: a for a in args if a.name is not None}
         positional = [a for a in args if a.name is None]
-        out: list[str] = []
+        out: list = []
         pi = 0
         for p in params:
             expect = self.type_tag(p.type) if p.type is not None else None
             if pi < len(positional):
-                code, _ = self._emit_expr(positional[pi].value, ctx, w, expect=expect)
-                out.append(code)
+                code, tag = self._emit_expr(positional[pi].value, ctx, w, expect=expect)
                 pi += 1
             elif p.name in by_name:
-                code, _ = self._emit_expr(by_name[p.name].value, ctx, w, expect=expect)
-                out.append(code)
+                code, tag = self._emit_expr(by_name[p.name].value, ctx, w, expect=expect)
             elif p.default is not None:
-                code, _ = self._emit_expr(p.default, ctx, w, expect=expect)
-                out.append(code)
+                code, tag = self._emit_expr(p.default, ctx, w, expect=expect)
             else:
                 raise unsupported(
                     f"missing argument `{p.name}` in call to `{fn.name}`", span)
-        return out
+            out.append((code, expect if expect is not None else tag))
+        return self._sequence(out, ctx, w)
 
     def _emit_call(self, node: ast.CallExpr, ctx: FnContext, w: Writer, expect=None):
         callee = node.callee
+        if isinstance(callee, ast.NameExpr) and callee.name in ctx.var_types:
+            tag = ctx.var_types[callee.name]
+            if isinstance(tag, tuple) and tag[0] == "fn":
+                return self._call_closure(callee.name, tag, node.args, ctx, w, node.span)
+        if isinstance(callee, ast.OptFieldExpr):
+            return self._emit_opt_chain(callee, node.args, ctx, w)
         if isinstance(callee, ast.NameExpr):
             name = callee.name
             if name == "Some":
@@ -1517,6 +2023,8 @@ class CBackend:
                 return f"ax_res_err_{mangle(rtag)}({code})", rtag
             if name in self.functions:
                 fn = self.functions[name]
+                if fn.generics:
+                    return self._emit_generic_call(fn, node.args, ctx, w, node.span)
                 args = self._order_args(fn, node.args, ctx, w, node.span)
                 return f"{self._cname(fn, None)}({', '.join(args)})", self.type_tag(fn.return_type)
             if name == "read_line" and not node.args:
@@ -1554,7 +2062,128 @@ class CBackend:
             raise unsupported(f"native backend cannot call `{name}`", node.span)
         if isinstance(callee, ast.FieldExpr):
             return self._emit_method_call(callee, node.args, ctx, w, expect, node.span)
+        code, tag = self._emit_expr(callee, ctx, w)
+        if isinstance(tag, tuple) and tag[0] == "fn":
+            return self._call_closure(code, tag, node.args, ctx, w, node.span)
         raise unsupported("native backend does not support this call form", node.span)
+
+    def _bind_generics(self, texpr, tag, generics: set, out: dict) -> None:
+        """Unify a parameter's type expression with an argument's type tag."""
+        if isinstance(texpr, ast.RefType):
+            self._bind_generics(texpr.inner, tag, generics, out)
+        elif isinstance(texpr, ast.TypeName):
+            if texpr.name in generics and not texpr.args:
+                out.setdefault(texpr.name, tag)
+            elif isinstance(tag, tuple):
+                kinds = {"Vec": "vec", "Option": "opt", "Result": "res", "Map": "map"}
+                if kinds.get(texpr.name) == tag[0]:
+                    targs = texpr.args[1:] if tag[0] == "map" else texpr.args
+                    for sub, t in zip(targs, tag[1:]):
+                        self._bind_generics(sub, t, generics, out)
+        elif isinstance(texpr, ast.OptionalType) and isinstance(tag, tuple) and tag[0] == "opt":
+            self._bind_generics(texpr.inner, tag[1], generics, out)
+        elif isinstance(texpr, ast.ResultType) and isinstance(tag, tuple) and tag[0] == "res":
+            self._bind_generics(texpr.ok, tag[1], generics, out)
+            if texpr.err is not None:
+                self._bind_generics(texpr.err, tag[2], generics, out)
+        elif isinstance(texpr, (ast.SliceType, ast.ArrayType)) and isinstance(tag, tuple) \
+                and tag[0] == "vec":
+            self._bind_generics(texpr.elem, tag[1], generics, out)
+        elif isinstance(texpr, ast.TupleType) and isinstance(tag, tuple) and tag[0] == "tup":
+            for sub, t in zip(texpr.elems, tag[1:]):
+                self._bind_generics(sub, t, generics, out)
+        elif isinstance(texpr, ast.FnType) and isinstance(tag, tuple) and tag[0] == "fn":
+            if texpr.ret is not None:
+                self._bind_generics(texpr.ret, tag[1], generics, out)
+            for sub, t in zip(texpr.params, tag[2:]):
+                self._bind_generics(sub, t, generics, out)
+
+    def _mentions(self, texpr, names: set) -> bool:
+        found: set = set()
+        self._free_names_type(texpr, found)
+        return bool(found & names)
+
+    def _free_names_type(self, texpr, out: set) -> None:
+        if isinstance(texpr, ast.TypeName):
+            out.add(texpr.name)
+        if isinstance(texpr, ast.Node):
+            for f in texpr.__dataclass_fields__:
+                if f != "span":
+                    v = getattr(texpr, f)
+                    for x in (v if isinstance(v, list) else [v]):
+                        if isinstance(x, ast.Node):
+                            self._free_names_type(x, out)
+
+    def _partial_tag(self, texpr):
+        """Like `type_tag`, but unresolved parts of a function type become None
+        (a closure argument then infers them, binding type parameters)."""
+        try:
+            return self.type_tag(texpr)
+        except Diagnostic:
+            if not isinstance(texpr, ast.FnType):
+                return None
+        parts = []
+        for t in [texpr.ret, *texpr.params]:
+            try:
+                parts.append(self.type_tag(t) if t is not None else "void")
+            except Diagnostic:
+                parts.append(None)
+        return ("fn", *parts)
+
+    def _emit_generic_call(self, fn: ast.FnDef, args, ctx: FnContext, w: Writer, span):
+        """Monomorphize a generic function for the argument types at this call."""
+        generics = set(fn.generics)
+        params = [p for p in fn.params if not p.is_self]
+        positional = [a for a in args if a.name is None]
+        named = {a.name: a for a in args if a.name is not None}
+        codes: list = []
+        bindings: dict = {}
+        deferred = []
+        for i, p in enumerate(params):
+            arg = positional[i] if i < len(positional) else named.get(p.name)
+            if arg is None:
+                raise unsupported(f"missing argument `{p.name}` in call to `{fn.name}`", span)
+            if p.type is None:
+                raise unsupported(f"parameter `{p.name}` needs a type annotation", p.span)
+            if self._mentions(p.type, generics):
+                if isinstance(arg.value, ast.LambdaExpr):
+                    deferred.append(i)  # closures need the bindings first
+                    codes.append(None)
+                    continue
+                code, tag = self._emit_expr(arg.value, ctx, w)
+                self._bind_generics(p.type, tag, generics, bindings)
+            else:
+                code, tag = self._emit_expr(arg.value, ctx, w, expect=self.type_tag(p.type))
+            codes.append(code)
+        saved = self._tenv
+        for i in deferred:
+            self._tenv = {**saved, **bindings}
+            try:
+                expect = self._partial_tag(params[i].type)
+            finally:
+                self._tenv = saved
+            arg = positional[i] if i < len(positional) else named[params[i].name]
+            code, tag = self._emit_expr(arg.value, ctx, w, expect=expect)
+            self._bind_generics(params[i].type, tag, generics, bindings)
+            codes[i] = code
+        missing = generics - set(bindings)
+        if missing:
+            raise unsupported(
+                f"cannot infer type parameter `{sorted(missing)[0]}` of `{fn.name}` natively", span)
+        key = (fn.name, tuple(sorted(bindings.items(), key=lambda kv: kv[0])))
+        self._tenv = dict(bindings)
+        try:
+            if key not in self._specs:
+                cname = f"{fn.name}__g{len(self._specs)}"
+                self._specs[key] = cname
+                self._pending_specs.append((fn, bindings, cname))
+                self.spec_protos.append(self._prototype(fn) + ";")
+            ret = self.type_tag(fn.return_type)
+            self.ensure(ret)
+            cname = self._specs[key]
+        finally:
+            self._tenv = saved
+        return f"{cname}({', '.join(codes)})", ret
 
     def _emit_variant_ctor(self, owner: str, variant: str, args, ctx, w, span):
         edef = self.enums[owner]
@@ -1568,10 +2197,12 @@ class CBackend:
         if len(args) != len(vdef.payload):
             raise unsupported(
                 f"variant `{variant}` expects {len(vdef.payload)} arguments", span)
-        codes = []
+        items = []
         for a, (_, ftype) in zip(args, vdef.payload):
-            code, _ = self._emit_expr(a.value, ctx, w, expect=self.type_tag(ftype))
-            codes.append(code)
+            ftag = self.type_tag(ftype)
+            code, _ = self._emit_expr(a.value, ctx, w, expect=ftag)
+            items.append((code, ftag))
+        codes = self._sequence(items, ctx, w)
         return f"{owner}_mk_{variant}({', '.join(codes)})", tag
 
     def _emit_method_call(self, field: ast.FieldExpr, args: list[ast.Arg],
@@ -1595,6 +2226,8 @@ class CBackend:
                             self.type_tag(m.return_type))
             if rname == "File":
                 return self._emit_file_static(mname, args, ctx, w, span)
+            if rname == "Process":
+                return self._emit_process(mname, args, ctx, w, span)
             if rname == "Vec" and mname == "new":
                 if isinstance(expect, tuple) and expect[0] == "vec":
                     self.ensure(expect)
@@ -1633,13 +2266,25 @@ class CBackend:
         table = self.methods.get(type_name) if type_name else None
         if table and mname in table:
             m = table[mname]
+            is_mut = bool(m.params and m.params[0].is_self and m.params[0].is_mut)
+            if not is_mut and args and "(" in rcode:
+                tmp = ctx.tmp()
+                w.line(f"{self.ctype(rtag)} {tmp} = {rcode};")
+                rcode = tmp
             arglist = self._order_args(m, args, ctx, w, span)
-            if m.params and m.params[0].is_self and m.params[0].is_mut:
+            if is_mut:
                 recv_arg = f"&({rcode})"
             else:
                 recv_arg = rcode
             joined = ", ".join([recv_arg, *arglist])
             return f"{type_name}__{mname}({joined})", self.type_tag(m.return_type)
+        if isinstance(rtag, str) and rtag in self.structs:
+            self.ensure(rtag)
+            ftag = self.struct_fields[rtag].get(mname)
+            if isinstance(ftag, tuple) and ftag[0] == "fn":
+                return self._call_closure(f"({rcode}).{cfield(mname)}", ftag, args, ctx, w, span)
+        if isinstance(rtag, tuple) and rtag[0] == "tup" and mname == "len":
+            return str(len(rtag) - 1), "int"
         raise unsupported(
             f"native backend cannot resolve method `{mname}` on `{rtag}`",
             field.span,
@@ -1696,6 +2341,51 @@ class CBackend:
                 return self._emit_str_slice(rcode, idx, ctx, w)
             i, _ = self._one_arg(args, ctx, w, "int")
             return f"ax_str_index({rcode}, {i})", "str"
+        if mname == "find" and args:
+            other, _ = self._one_arg(args, ctx, w, "str")
+            tag = ("opt", "int")
+            self.ensure(tag)
+            pos, out = ctx.tmp(), ctx.tmp()
+            w.line(f"int64_t {pos} = ax_str_find({rcode}, {other});")
+            w.line(f"{self.ctype(tag)} {out} = {pos} >= 0 ? ax_opt_some_int({pos}) : ax_opt_none_int();")
+            return out, tag
+        if mname in {"strip_prefix", "strip_suffix"} and args:
+            src, other = ctx.tmp(), ctx.tmp()
+            ocode, _ = self._one_arg(args, ctx, w, "str")
+            w.line(f"AxStr {src} = {rcode};")
+            w.line(f"AxStr {other} = {ocode};")
+            tag = ("opt", "str")
+            self.ensure(tag)
+            if mname == "strip_prefix":
+                test = f"ax_str_starts_with({src}, {other})"
+                rest = f"ax_str_slice({src}, {other}.len, {src}.len)"
+            else:
+                test = f"ax_str_ends_with({src}, {other})"
+                rest = f"ax_str_slice({src}, 0, {src}.len - {other}.len)"
+            return f"({test} ? ax_opt_some_str({rest}) : ax_opt_none_str())", tag
+        if mname == "split_once" and args:
+            src, sep, pos = ctx.tmp(), ctx.tmp(), ctx.tmp()
+            ocode, _ = self._one_arg(args, ctx, w, "str")
+            pair = ("tup", "str", "str")
+            tag = ("opt", pair)
+            self.ensure(tag)
+            w.line(f"AxStr {src} = {rcode};")
+            w.line(f"AxStr {sep} = {ocode};")
+            w.line(f"int64_t {pos} = {sep}.len ? ax_str_find({src}, {sep}) : -1;")
+            out = ctx.tmp()
+            w.line(f"{self.ctype(tag)} {out} = ax_opt_none_{mangle(pair)}();")
+            w.line(f"if ({pos} >= 0) {out} = ax_opt_some_{mangle(pair)}(({self.ctype(pair)}){{ "
+                   f"ax_str_slice({src}, 0, {pos}), ax_str_slice({src}, {pos} + {sep}.len, {src}.len) }});")
+            return out, tag
+        if mname == "bytes":
+            tag = ("vec", "int")
+            self.ensure(tag)
+            src, out, i = ctx.tmp(), ctx.tmp(), ctx.tmp()
+            w.line(f"AxStr {src} = {rcode};")
+            w.line(f"{self.ctype(tag)} {out} = ax_vec_new_int();")
+            w.line(f"for (int64_t {i} = 0; {i} < {src}.len; {i}++) "
+                   f"ax_vec_push_int(&{out}, (int64_t)(unsigned char){src}.data[{i}]);")
+            return out, tag
         if mname == "parse" and args and isinstance(args[0].value, ast.NameExpr):
             ty = args[0].value.name
             if ty in _INT_TYPES:
@@ -1749,19 +2439,28 @@ class CBackend:
         if mname == "pow" and args:
             e, _ = self._one_arg(args, ctx, w, "int")
             return f"ax_ipow({rcode}, {e})", "int"
+        if mname == "signum":
+            return f"ax_isignum({rcode})", "int"
+        if mname in {"is_even", "is_odd"}:
+            return f"((({rcode}) % 2 {'==' if mname == 'is_even' else '!='} 0))", "bool"
         raise unsupported(f"native backend does not support int.{mname} yet", span)
 
     def _emit_float_method(self, rcode, mname, args, ctx, w, span):
         if mname == "to_string":
             return f"ax_fmt_float({rcode})", "str"
         if mname == "to_int":
-            return f"((int64_t)({rcode}))", "int"
+            return f"ax_f2i({rcode})", "int"
         if mname in {"floor", "ceil"}:
-            return f"((int64_t){mname}({rcode}))", "int"
+            return f"ax_f2i({mname}({rcode}))", "int"
         if mname == "round":
             return f"ax_fround({rcode})", "int"
         if mname == "sqrt":
-            return f"sqrt({rcode})", "float"
+            return f"ax_fsqrt({rcode})", "float"
+        if mname == "is_nan":
+            return f"isnan({rcode})", "bool"
+        if mname == "pow" and args:
+            e, _ = self._one_arg(args, ctx, w, "float")
+            return f"pow({rcode}, {e})", "float"
         if mname == "abs":
             return f"fabs({rcode})", "float"
         if mname in {"max", "min"} and args:
@@ -1821,7 +2520,208 @@ class CBackend:
             else:
                 end = f"({rcode}).len"
             return f"ax_vec_slice_{s}({rcode}, {start}, {end})", rtag
+        return self._emit_vec_method_ext(rcode, rtag, mname, args, ctx, w, span)
+
+    def _emit_vec_method_ext(self, rcode, rtag, mname, args, ctx, w, span):
+        """Vec methods beyond the core set, including the higher-order ones
+        that take closures. Each lowers to an inline loop."""
+        elem = rtag[1]
+        s = mangle(elem)
+        ct, cv = self.ctype(elem), self.ctype(rtag)
+        if mname == "insert" and len(args) == 2:
+            i, _ = self._emit_expr(args[0].value, ctx, w, expect="int")
+            v, _ = self._emit_expr(args[1].value, ctx, w, expect=elem)
+            w.line(f"ax_vec_insert_{s}(&({rcode}), {i}, {v});")
+            return "((void)0)", "void"
+        if mname == "remove" and args:
+            i, _ = self._one_arg(args, ctx, w, "int")
+            out = ctx.tmp()
+            w.line(f"{ct} {out} = ax_vec_remove_{s}(&({rcode}), {i});")
+            return out, elem
+        if mname == "clear":
+            w.line(f"({rcode}).len = 0;")
+            return "((void)0)", "void"
+        if mname == "extend" and args:
+            other, _ = self._one_arg(args, ctx, w, rtag)
+            o, i = ctx.tmp(), ctx.tmp()
+            w.line(f"{cv} {o} = {other};")
+            w.line(f"for (int64_t {i} = 0; {i} < {o}.len; {i}++) ax_vec_push_{s}(&({rcode}), {o}.data[{i}]);")
+            return "((void)0)", "void"
+        if mname in {"iter", "clone"}:
+            return f"ax_vec_slice_{s}({rcode}, 0, ({rcode}).len)", rtag
+        if mname == "get_mut" and args:
+            i, _ = self._one_arg(args, ctx, w, "int")
+            return f"ax_vec_get_opt_{s}({rcode}, {i})", ("opt", elem)
+        src = ctx.tmp()
+        self.ensure(rtag)
+        w.line(f"{cv} {src} = {rcode};")
+        i = ctx.tmp()
+        loop = f"for (int64_t {i} = 0; {i} < {src}.len; {i}++)"
+        x = f"{src}.data[{i}]"
+        if mname in {"take", "skip"} and args:
+            n, _ = self._one_arg(args, ctx, w, "int")
+            if mname == "take":
+                return f"ax_vec_slice_{s}({src}, 0, ax_imax({n}, 0))", rtag
+            return f"ax_vec_slice_{s}({src}, ax_imax({n}, 0), {src}.len)", rtag
+        if mname in {"index_of", "dedup"}:
+            eq = self._eq_fn(elem)
+            if eq is None:
+                raise unsupported(f"Vec.{mname} needs comparable elements natively", span)
+            if mname == "index_of":
+                needle, _ = self._one_arg(args, ctx, w, elem)
+                nt, out = ctx.tmp(), ctx.tmp()
+                tag = ("opt", "int")
+                self.ensure(tag)
+                w.line(f"{ct} {nt} = {needle};")
+                w.line(f"{self.ctype(tag)} {out} = ax_opt_none_int();")
+                w.line(f"{loop} if ({eq(x, nt)}) {{ {out} = ax_opt_some_int({i}); break; }}")
+                return out, tag
+            out = ctx.tmp()
+            w.line(f"{cv} {out} = ax_vec_new_{s}();")
+            w.line(f"{loop} if ({out}.len == 0 || !({eq(f'{out}.data[{out}.len - 1]', x)})) "
+                   f"ax_vec_push_{s}(&{out}, {x});")
+            return out, rtag
+        if mname in {"min", "max"}:
+            if elem not in {"int", "float", "str"}:
+                raise unsupported(f"Vec.{mname} needs int, float, or str elements natively", span)
+            tag = ("opt", elem)
+            out = ctx.tmp()
+            better = (f"ax_str_cmp({x}, {out}.val) {'<' if mname == 'min' else '>'} 0"
+                      if elem == "str" else f"{x} {'<' if mname == 'min' else '>'} {out}.val")
+            w.line(f"{self.ctype(tag)} {out} = ax_opt_none_{s}();")
+            w.line(f"{loop} if (!{out}.has || {better}) {out} = ax_opt_some_{s}({x});")
+            return out, tag
+        if mname == "enumerate":
+            pair = ("tup", "int", elem)
+            tag = ("vec", pair)
+            self.ensure(tag)
+            out = ctx.tmp()
+            w.line(f"{self.ctype(tag)} {out} = ax_vec_new_{mangle(pair)}();")
+            w.line(f"{loop} ax_vec_push_{mangle(pair)}(&{out}, (({self.ctype(pair)}){{ {i}, {x} }}));")
+            return out, tag
+        if mname == "zip" and args:
+            other, otag = self._one_arg(args, ctx, w)
+            if not (isinstance(otag, tuple) and otag[0] == "vec"):
+                raise unsupported("Vec.zip expects a Vec", span)
+            pair = ("tup", elem, otag[1])
+            tag = ("vec", pair)
+            self.ensure(tag)
+            o, out = ctx.tmp(), ctx.tmp()
+            w.line(f"{self.ctype(otag)} {o} = {other};")
+            w.line(f"{self.ctype(tag)} {out} = ax_vec_new_{mangle(pair)}();")
+            w.line(f"for (int64_t {i} = 0; {i} < {src}.len && {i} < {o}.len; {i}++) "
+                   f"ax_vec_push_{mangle(pair)}(&{out}, (({self.ctype(pair)}){{ {x}, {o}.data[{i}] }}));")
+            return out, tag
+        if mname in {"windows", "chunks"} and args:
+            n, _ = self._one_arg(args, ctx, w, "int")
+            nt, out = ctx.tmp(), ctx.tmp()
+            tag = ("vec", rtag)
+            self.ensure(tag)
+            what = "window size" if mname == "windows" else "chunk size"
+            w.line(f"int64_t {nt} = {n};")
+            w.line(f'if ({nt} <= 0) ax_panic(ax_str_lit("{what} must be positive"));')
+            sv = mangle(rtag)
+            w.line(f"{self.ctype(tag)} {out} = ax_vec_new_{sv}();")
+            if mname == "windows":
+                w.line(f"for (int64_t {i} = 0; {i} + {nt} <= {src}.len; {i}++) "
+                       f"ax_vec_push_{sv}(&{out}, ax_vec_slice_{s}({src}, {i}, {i} + {nt}));")
+            else:
+                w.line(f"for (int64_t {i} = 0; {i} < {src}.len; {i} += {nt}) "
+                       f"ax_vec_push_{sv}(&{out}, ax_vec_slice_{s}({src}, {i}, {i} + {nt}));")
+            return out, tag
+        # higher-order methods
+        if mname == "map" and args:
+            fn, ftag = self._closure_arg(args[0], None, [elem], ctx, w, span, "Vec.map")
+            rt = ftag[1]
+            if rt == "void":
+                raise unsupported("Vec.map needs a closure that returns a value", span)
+            tag = ("vec", rt)
+            self.ensure(tag)
+            out = ctx.tmp()
+            w.line(f"{self.ctype(tag)} {out} = ax_vec_new_{mangle(rt)}();")
+            w.line(f"{loop} ax_vec_push_{mangle(rt)}(&{out}, {self._invoke(fn, x)});")
+            return out, tag
+        if mname == "filter" and args:
+            fn, ftag = self._closure_arg(args[0], "bool", [elem], ctx, w, span, "Vec.filter")
+            out = ctx.tmp()
+            w.line(f"{cv} {out} = ax_vec_new_{s}();")
+            w.line(f"{loop} if ({self._truthy(self._invoke(fn, x), ftag[1])}) ax_vec_push_{s}(&{out}, {x});")
+            return out, rtag
+        if mname == "fold" and len(args) == 2:
+            init, itag = self._emit_expr(args[0].value, ctx, w)
+            self.ensure(itag)
+            fn, ftag = self._closure_arg(args[1], itag, [itag, elem], ctx, w, span, "Vec.fold")
+            acc = ctx.tmp()
+            w.line(f"{self.ctype(itag)} {acc} = {init};")
+            w.line(f"{loop} {acc} = {self._invoke(fn, acc, x)};")
+            return acc, itag
+        if mname in {"any", "all", "count", "find", "position", "for_each"} and args:
+            ret = None if mname == "for_each" else "bool"
+            fn, ftag = self._closure_arg(args[0], ret, [elem], ctx, w, span, f"Vec.{mname}")
+            hit = self._truthy(self._invoke(fn, x), ftag[1]) if mname != "for_each" else None
+            out = ctx.tmp()
+            if mname == "for_each":
+                w.line(f"{loop} {self._invoke(fn, x)};")
+                return "((void)0)", "void"
+            if mname == "any":
+                w.line(f"bool {out} = false;")
+                w.line(f"{loop} if ({hit}) {{ {out} = true; break; }}")
+                return out, "bool"
+            if mname == "all":
+                w.line(f"bool {out} = true;")
+                w.line(f"{loop} if (!({hit})) {{ {out} = false; break; }}")
+                return out, "bool"
+            if mname == "count":
+                w.line(f"int64_t {out} = 0;")
+                w.line(f"{loop} if ({hit}) {out}++;")
+                return out, "int"
+            if mname == "find":
+                tag = ("opt", elem)
+                w.line(f"{self.ctype(tag)} {out} = ax_opt_none_{s}();")
+                w.line(f"{loop} if ({hit}) {{ {out} = ax_opt_some_{s}({x}); break; }}")
+                return out, tag
+            tag = ("opt", "int")
+            self.ensure(tag)
+            w.line(f"{self.ctype(tag)} {out} = ax_opt_none_int();")
+            w.line(f"{loop} if ({hit}) {{ {out} = ax_opt_some_int({i}); break; }}")
+            return out, tag
+        if mname == "sort_by" and args:
+            fn, ftag = self._closure_arg(args[0], "int", [elem, elem], ctx, w, span, "Vec.sort_by")
+            helper = self._ensure_sort_by(rtag, ftag)
+            return f"{helper}({src}, {fn})", rtag
         raise unsupported(f"native backend does not support Vec.{mname} yet", span)
+
+    def _ensure_sort_by(self, rtag, ftag) -> str:
+        """A stable bottom-up merge sort driven by a comparator closure (the
+        interpreter's `sorted` is stable too, so equal keys keep their order)."""
+        name = f"ax_vec_sort_by_{mangle(rtag)}_{mangle(ftag)}"
+        if name in self._helpers:
+            return name
+        self._helpers.add(name)
+        cv, ct, cf = self.ctype(rtag), self.ctype(rtag[1]), self.ctype(ftag)
+        s = mangle(rtag[1])
+        self.lambda_defs.append(
+            f"static {cv} {name}({cv} v, {cf} cmp) {{\n"
+            f"    {cv} out = ax_vec_slice_{s}(v, 0, v.len);\n"
+            f"    int64_t n = out.len;\n"
+            f"    if (n < 2) return out;\n"
+            f"    {ct} *buf = ({ct} *)ax_alloc((size_t)n * sizeof({ct}));\n"
+            f"    for (int64_t width = 1; width < n; width *= 2) {{\n"
+            f"        for (int64_t lo = 0; lo < n; lo += 2 * width) {{\n"
+            f"            int64_t mid = lo + width < n ? lo + width : n;\n"
+            f"            int64_t hi = lo + 2 * width < n ? lo + 2 * width : n;\n"
+            f"            int64_t a = lo, b = mid, k = lo;\n"
+            f"            while (a < mid && b < hi)\n"
+            f"                buf[k++] = cmp.call(cmp.env, out.data[b], out.data[a]) < 0\n"
+            f"                    ? out.data[b++] : out.data[a++];\n"
+            f"            while (a < mid) buf[k++] = out.data[a++];\n"
+            f"            while (b < hi) buf[k++] = out.data[b++];\n"
+            f"        }}\n"
+            f"        memcpy(out.data, buf, (size_t)n * sizeof({ct}));\n"
+            f"    }}\n"
+            f"    free(buf);\n"
+            f"    return out;\n}}")
+        return name
 
     def _emit_vec_join(self, rcode, elem, sep, ctx, w):
         show = self.ensure_show(elem) if elem != "str" else None
@@ -1861,9 +2761,22 @@ class CBackend:
             k, _ = self._one_arg(args, ctx, w, "str")
             return f"ax_map_contains_{s}({rcode}, {k})", "bool"
         if mname == "keys":
-            return f"({rcode}).keys", ("vec", "str")
+            return f"ax_vec_slice_str(({rcode}).keys, 0, ({rcode}).keys.len)", ("vec", "str")
         if mname == "values":
-            return f"({rcode}).vals", ("vec", rtag[1])
+            return f"ax_vec_slice_{s}(({rcode}).vals, 0, ({rcode}).vals.len)", ("vec", rtag[1])
+        if mname == "clear":
+            w.line(f"({rcode}).keys.len = 0; ({rcode}).vals.len = 0;")
+            return "((void)0)", "void"
+        if mname in {"entries", "iter"}:
+            pair = ("tup", "str", rtag[1])
+            tag = ("vec", pair)
+            self.ensure(tag)
+            m, out, i = ctx.tmp(), ctx.tmp(), ctx.tmp()
+            w.line(f"{self.ctype(rtag)} {m} = {rcode};")
+            w.line(f"{self.ctype(tag)} {out} = ax_vec_new_{mangle(pair)}();")
+            w.line(f"for (int64_t {i} = 0; {i} < {m}.keys.len; {i}++) ax_vec_push_{mangle(pair)}"
+                   f"(&{out}, (({self.ctype(pair)}){{ {m}.keys.data[{i}], {m}.vals.data[{i}] }}));")
+            return out, tag
         raise unsupported(f"native backend does not support Map.{mname} yet", span)
 
     def _emit_opt_method(self, rcode, rtag, mname, args, ctx, w, span):
@@ -1882,6 +2795,51 @@ class CBackend:
         if mname == "expect" and args:
             msg = self._to_str(w, *self._emit_expr(args[0].value, ctx, w))
             return f"ax_opt_expect_{s}({rcode}, {msg})", rtag[1]
+        t = rtag[1]
+        src = ctx.tmp()
+        w.line(f"{self.ctype(rtag)} {src} = {rcode};")
+        if mname == "or" and args:
+            other, _ = self._one_arg(args, ctx, w, rtag)
+            out = ctx.tmp()
+            w.line(f"{self.ctype(rtag)} {out} = {src};")
+            w.line(f"if (!{out}.has) {out} = {other};")
+            return out, rtag
+        if mname == "ok_or" and args:
+            e, etag = self._one_arg(args, ctx, w)
+            tag = ("res", t, etag)
+            self.ensure(tag)
+            out = ctx.tmp()
+            w.line(f"{self.ctype(tag)} {out};")
+            w.line(f"if ({src}.has) {out} = ax_res_ok_{mangle(tag)}({src}.val); "
+                   f"else {out} = ax_res_err_{mangle(tag)}({e});")
+            return out, tag
+        if mname == "unwrap_or_else" and args:
+            fn, ftag = self._closure_arg(args[0], t, [], ctx, w, span, "Option.unwrap_or_else")
+            out = ctx.tmp()
+            w.line(f"{self.ctype(t)} {out} = {src}.has ? {src}.val : {self._invoke(fn)};")
+            return out, t
+        if mname in {"map", "and_then", "filter"} and args:
+            want = {"map": None, "and_then": None, "filter": "bool"}[mname]
+            fn, ftag = self._closure_arg(args[0], want, [t], ctx, w, span, f"Option.{mname}")
+            out = ctx.tmp()
+            if mname == "filter":
+                w.line(f"{self.ctype(rtag)} {out} = ax_opt_none_{s}();")
+                w.line(f"if ({src}.has && {self._truthy(self._invoke(fn, f'{src}.val'), ftag[1])}) "
+                       f"{out} = {src};")
+                return out, rtag
+            if mname == "map":
+                tag = ("opt", ftag[1])
+                self.ensure(tag)
+                w.line(f"{self.ctype(tag)} {out} = ax_opt_none_{mangle(ftag[1])}();")
+                w.line(f"if ({src}.has) {out} = ax_opt_some_{mangle(ftag[1])}"
+                       f"({self._invoke(fn, f'{src}.val')});")
+                return out, tag
+            tag = ftag[1]
+            if not (isinstance(tag, tuple) and tag[0] == "opt"):
+                raise unsupported("Option.and_then needs a closure returning an Option", span)
+            w.line(f"{self.ctype(tag)} {out} = ax_opt_none_{mangle(tag[1])}();")
+            w.line(f"if ({src}.has) {out} = {self._invoke(fn, f'{src}.val')};")
+            return out, tag
         raise unsupported(f"native backend does not support Option.{mname} yet", span)
 
     def _emit_res_method(self, rcode, rtag, mname, args, ctx, w, span):
@@ -1906,7 +2864,72 @@ class CBackend:
             w.line(f"{self.ctype(rtag)} {tmp} = {rcode};")
             return (f"({tmp}.ok ? ax_opt_some_{mangle(rtag[1])}({tmp}.val) "
                     f": ax_opt_none_{mangle(rtag[1])}())", otag)
+        t, e = rtag[1], rtag[2]
+        src = ctx.tmp()
+        w.line(f"{self.ctype(rtag)} {src} = {rcode};")
+        if mname == "err":
+            otag = ("opt", e)
+            self.ensure(otag)
+            return (f"({src}.ok ? ax_opt_none_{mangle(e)}() : ax_opt_some_{mangle(e)}({src}.err))",
+                    otag)
+        if mname == "expect" and args:
+            msg = self._to_str(w, *self._emit_expr(args[0].value, ctx, w))
+            show = self.ensure_show(e)
+            w.line(f"if (!{src}.ok) ax_panic(ax_str_concat(ax_str_concat({msg}, "
+                   f'ax_str_lit(": ")), {show}({src}.err)));')
+            return f"{src}.val", t
+        if mname == "unwrap_or_else" and args:
+            fn, ftag = self._closure_arg(args[0], t, [e], ctx, w, span, "Result.unwrap_or_else")
+            out = ctx.tmp()
+            w.line(f"{self.ctype(t)} {out} = {src}.ok ? {src}.val : {self._invoke(fn, f'{src}.err')};")
+            return out, t
+        if mname in {"map", "map_err", "and_then"} and args:
+            arg_t = e if mname == "map_err" else t
+            fn, ftag = self._closure_arg(args[0], None, [arg_t], ctx, w, span, f"Result.{mname}")
+            out = ctx.tmp()
+            if mname == "and_then":
+                tag = ftag[1]
+                if not (isinstance(tag, tuple) and tag[0] == "res"):
+                    raise unsupported("Result.and_then needs a closure returning a Result", span)
+                w.line(f"{self.ctype(tag)} {out};")
+                w.line(f"if ({src}.ok) {out} = {self._invoke(fn, f'{src}.val')}; "
+                       f"else {out} = ax_res_err_{mangle(tag)}({src}.err);")
+                return out, tag
+            tag = ("res", ftag[1], e) if mname == "map" else ("res", t, ftag[1])
+            self.ensure(tag)
+            w.line(f"{self.ctype(tag)} {out};")
+            if mname == "map":
+                w.line(f"if ({src}.ok) {out} = ax_res_ok_{mangle(tag)}({self._invoke(fn, f'{src}.val')}); "
+                       f"else {out} = ax_res_err_{mangle(tag)}({src}.err);")
+            else:
+                w.line(f"if ({src}.ok) {out} = ax_res_ok_{mangle(tag)}({src}.val); "
+                       f"else {out} = ax_res_err_{mangle(tag)}({self._invoke(fn, f'{src}.err')});")
+            return out, tag
         raise unsupported(f"native backend does not support Result.{mname} yet", span)
+
+    def _emit_process(self, mname, args, ctx, w, span):
+        if mname == "args" and not args:
+            tag = ("vec", "str")
+            self.ensure(tag)
+            out, i = ctx.tmp(), ctx.tmp()
+            w.line(f"{self.ctype(tag)} {out} = ax_vec_new_str();")
+            w.line(f"for (int {i} = 1; {i} < ax_argc; {i}++) "
+                   f"ax_vec_push_str(&{out}, ax_str_lit(ax_argv[{i}]));")
+            return out, tag
+        if mname == "exit":
+            code = self._one_arg(args, ctx, w, "int")[0] if args else "0"
+            w.line(f"ax_exit({code});")
+            return "((void)0)", "void"
+        if mname == "env" and args:
+            name, _ = self._one_arg(args, ctx, w, "str")
+            tag = ("opt", "str")
+            self.ensure(tag)
+            val, out = ctx.tmp(), ctx.tmp()
+            w.line(f"AxStr {val};")
+            w.line(f"{self.ctype(tag)} {out} = ax_getenv({name}, &{val}) "
+                   f"? ax_opt_some_str({val}) : ax_opt_none_str();")
+            return out, tag
+        raise unsupported(f"native backend does not support Process.{mname}", span)
 
     def _emit_file_static(self, mname, args, ctx, w, span):
         if mname == "open" and args:
@@ -1951,15 +2974,15 @@ class CBackend:
         raise unsupported(f"native backend does not support File.{mname} yet", span)
 
     def _emit_math(self, mname: str, args, ctx, w):
-        cmap = {"sqrt": "sqrt", "sin": "sin", "cos": "cos", "tan": "tan",
-                "log": "log", "exp": "exp", "pow": "pow"}
+        cmap = {"sqrt": "ax_fsqrt", "sin": "sin", "cos": "cos", "tan": "tan",
+                "log": "ax_flog", "exp": "exp", "pow": "pow"}
         if mname in cmap:
             arglist = ", ".join(
                 self._emit_expr(a.value, ctx, w, expect="float")[0] for a in args)
             return f"{cmap[mname]}({arglist})", "float"
         if mname in {"floor", "ceil"}:
             a, _ = self._emit_expr(args[0].value, ctx, w, expect="float")
-            return f"((int64_t){mname}({a}))", "int"
+            return f"ax_f2i({mname}({a}))", "int"
         if mname == "round":
             a, _ = self._emit_expr(args[0].value, ctx, w, expect="float")
             return f"ax_fround({a})", "int"
@@ -1999,7 +3022,11 @@ class CBackend:
             self.ensure(tag)
             fields = self.struct_fields.get(tag, {})
             if node.name in fields:
-                return f"({code}).{node.name}", fields[node.name]
+                return f"({code}).{cfield(node.name)}", fields[node.name]
+        if isinstance(tag, tuple) and tag[0] == "tup" and node.name.isdigit():
+            i = int(node.name)
+            if i + 1 < len(tag):
+                return f"({code}).f{i}", tag[i + 1]
         raise unsupported(
             f"native backend cannot access field `{node.name}` on `{tag}`",
             node.span,
@@ -2047,7 +3074,9 @@ class CBackend:
                 code, _ = self._emit_expr(f.default, ctx, w, expect=ftag)
             else:
                 code = self._zero_value(ftag, ctx, w)
-            inits.append(f".{f.name} = {code}")
+            inits.append((f.name, code, ftag))
+        codes = self._sequence([(c, t) for _, c, t in inits], ctx, w)
+        inits = [f".{cfield(n)} = {c}" for (n, _, _), c in zip(inits, codes)]
         body = ", ".join(inits)
         return f"(({name}){{{body}}})", name
 
@@ -2110,12 +3139,13 @@ class CBackend:
         return tmp, vtag
 
     def _emit_fstr(self, node: ast.FStr, ctx: FnContext, w: Writer) -> str:
-        pieces: list[str] = []
+        items: list = []
         for part in node.parts:
             if isinstance(part, str):
-                pieces.append(f"ax_str_lit({self._c_string(part)})")
+                items.append((f"ax_str_lit({self._c_string(part)})", "str"))
             else:
-                pieces.append(self._to_str(w, *self._emit_expr(part, ctx, w)))
+                items.append((self._to_str(w, *self._emit_expr(part, ctx, w)), "str"))
+        pieces = self._sequence(items, ctx, w)
         if not pieces:
             return 'ax_str_lit("")'
         acc = pieces[0]
@@ -2157,5 +3187,103 @@ class CBackend:
         return "".join(out)
 
 
+# Identifiers AXON programs may use but C (or the runtime and the code this
+# backend emits) reserves. User names in this set are renamed in the C output.
+_C_RESERVED = {
+    "auto", "char", "const", "default", "double", "extern", "float", "goto",
+    "inline", "int", "long", "register", "restrict", "short", "signed",
+    "sizeof", "static", "struct", "switch", "typedef", "union", "unsigned",
+    "volatile", "bool", "true", "false", "NULL", "exit", "free",
+    "malloc", "realloc", "calloc", "memcpy", "memmove", "memset", "memcmp",
+    "strlen", "strtod", "strtoll", "snprintf", "printf", "puts", "fputs",
+    "fputc", "fgetc", "fwrite", "fflush", "fopen", "fclose", "fread", "fseek",
+    "ftell", "rewind", "ferror", "getenv", "qsort", "sqrt", "pow", "floor",
+    "ceil", "fabs", "fmod", "sin", "cos", "tan", "log", "exp", "llround",
+    "isnan", "abs", "labs", "stdout", "stderr", "stdin", "errno", "EOF",
+    "FILE", "INFINITY", "NAN", "size_t", "int8_t", "int16_t", "int32_t",
+    "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "INT64_MAX",
+    "INT64_MIN", "INT64_C", "argc", "argv", "env", "self_", "out", "acc",
+}
+# AXON type names also used as values (`s.parse(int)`); never renamed
+_AXON_TYPE_VALUES = {
+    "int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16",
+    "uint32", "uint64", "float32", "float64", "bool", "str", "byte", "rune",
+}
+
+
+def _reserved(name: str) -> bool:
+    return (name in _C_RESERVED or name.startswith(("ax_", "Ax", "__ax"))) \
+        and name not in _AXON_TYPE_VALUES
+
+
+def cfield(name: str) -> str:
+    """C member name for a struct field / enum payload field."""
+    return name + "__u" if _reserved(name) else name
+
+
+def _sanitize_names(module: ast.Module) -> ast.Module:
+    """Return a copy of `module` with reserved value identifiers renamed.
+
+    Only names of functions, parameters, locals, and pattern bindings change;
+    field names keep their spelling (they are displayed) and are mapped to C
+    member names by `cfield` instead.
+    """
+    module = copy.deepcopy(module)
+    declared: set[str] = set()
+
+    def collect(node) -> None:
+        if isinstance(node, (list, tuple)):
+            for x in node:
+                collect(x)
+            return
+        if not isinstance(node, ast.Node):
+            return
+        if isinstance(node, (ast.Param, ast.BindingPattern, ast.LetStmt)):
+            declared.add(node.name)
+        if isinstance(node, ast.FnDef) and node.owner is None:
+            declared.add(node.name)
+        for f in node.__dataclass_fields__:
+            if f != "span":
+                collect(getattr(node, f))
+
+    collect(module.items)
+
+    def fix(name):
+        if not isinstance(name, str) or not _reserved(name):
+            return name
+        if name in BUILTIN_FUNCTIONS and name not in declared:
+            return name  # a call to the AXON builtin, not a user definition
+        return name + "__u"
+
+    def walk(node) -> None:
+        if isinstance(node, list):
+            for x in node:
+                walk(x)
+            return
+        if isinstance(node, tuple):
+            for x in node:
+                walk(x)
+            return
+        if not isinstance(node, ast.Node):
+            return
+        if isinstance(node, ast.NameExpr):
+            node.name = fix(node.name)
+        elif isinstance(node, (ast.Param, ast.BindingPattern, ast.Arg)):
+            node.name = fix(node.name)
+        elif isinstance(node, ast.LetStmt):
+            node.name = fix(node.name)
+            node.catch_name = fix(node.catch_name)
+        elif isinstance(node, ast.TryExpr):
+            node.catch_name = fix(node.catch_name)
+        elif isinstance(node, ast.FnDef) and node.owner is None:
+            node.name = fix(node.name)
+        for f in node.__dataclass_fields__:
+            if f != "span":
+                walk(getattr(node, f))
+
+    walk(module.items)
+    return module
+
+
 def generate_c(module: ast.Module) -> str:
-    return CBackend(module).generate()
+    return CBackend(_sanitize_names(module)).generate()

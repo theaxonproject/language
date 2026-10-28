@@ -16,7 +16,7 @@ from .lexer import Token, tokenize
 # Binary operator precedence; higher binds tighter.
 PREC = {
     "|>": 1,
-    "..": 2,
+    "..": 2, "..=": 2,
     "or": 3,
     "and": 4,
     "==": 5, "!=": 5, "<": 5, "<=": 5, ">": 5, ">=": 5, "is": 5,
@@ -387,7 +387,10 @@ class Parser:
             self.skip_newlines()
             while not self.at("DEDENT") and not self.at("EOF"):
                 attrs = self.parse_attributes()
-                methods.append(self.parse_fn(attrs, owner=name))
+                method = self.parse_fn(attrs, owner=name)
+                if method.body is not None and not method.body.stmts:
+                    method.body = None  # a required method: signature only
+                methods.append(method)
                 self.skip_newlines()
             self.expect("DEDENT")
         return ast.TraitDef(start, name, generics, methods)
@@ -488,7 +491,14 @@ class Parser:
     def parse_let(self) -> ast.Node:
         start = self.expect("KW", "let").span
         is_mut = bool(self.accept("KW", "mut"))
-        # destructuring `let Some(x) = ...` is parsed as if-let only; here a name.
+        if self.at("OP", "("):
+            # tuple destructuring: `let (a, b) = EXPR`
+            pattern = self.parse_pattern()
+            self.expect("OP", "=")
+            value = self.parse_expr()
+            if not isinstance(value, ast.MatchExpr):
+                self.end_statement()
+            return ast.LetStmt(start, "_", None, value, is_mut, pattern=pattern)
         name = self.advance().value
         type_ann = None
         if self.accept("OP", ":"):
@@ -707,25 +717,41 @@ class Parser:
             return self.parse_fn_lambda()
         if self.peek().kind == "NAME" and self._lookahead_lambda():
             return self.parse_bare_lambda()
+        if self.at("OP", "(") and self._lookahead_paren_lambda():
+            return self.parse_paren_lambda()
         return self.parse_binary(0)
 
+    def _lookahead_paren_lambda(self) -> bool:
+        """`(a, b) => body` / `() => body` / `(x: int) => body`."""
+        i = self.pos + 1
+        depth = 1
+        while i < len(self.tokens) and depth:
+            v = self.tokens[i]
+            if v.kind == "EOF":
+                return False
+            if v.kind == "OP" and v.value in {"(", "[", "{"}:
+                depth += 1
+            elif v.kind == "OP" and v.value in {")", "]", "}"}:
+                depth -= 1
+            i += 1
+        return i < len(self.tokens) and self.tokens[i].value == "=>"
+
+    def parse_paren_lambda(self) -> ast.Expr:
+        start = self.expect("OP", "(").span
+        params, _ = self.parse_params()
+        self.expect_value("=>")
+        body = self.parse_expr()
+        return ast.LambdaExpr(start, params, body, [])
+
     def _lookahead_lambda(self) -> bool:
-        i = self.pos
-        if self.tokens[i].kind != "NAME":
-            return False
-        i += 1
-        while self.tokens[i].value == "," and self.tokens[i + 1].kind == "NAME":
-            i += 2
-        return self.tokens[i].value == "=>"
+        # `x => body`. Several parameters need parentheses, `(a, b) => body`,
+        # since `f(a, b => body)` would otherwise be ambiguous.
+        return self.tokens[self.pos].kind == "NAME" and self.tokens[self.pos + 1].value == "=>"
 
     def parse_bare_lambda(self) -> ast.Expr:
         start = self.peek().span
-        params: list[ast.Param] = []
-        while True:
-            name_tok = self.expect("NAME")
-            params.append(ast.Param(name_tok.span, name_tok.value, None, None, False, False))
-            if not self.accept("OP", ","):
-                break
+        name_tok = self.expect("NAME")
+        params = [ast.Param(name_tok.span, name_tok.value, None, None, False, False)]
         self.expect_value("=>")
         body = self.parse_expr()
         return ast.LambdaExpr(start, params, body, [])
@@ -734,11 +760,12 @@ class Parser:
         start = self.expect("KW", "fn").span
         self.expect("OP", "(")
         params, _ = self.parse_params()
+        ret = None
         if self.accept("OP", "->"):
-            self.parse_type()
+            ret = self.parse_type()
         self.expect("OP", "=")
         body = self.parse_expr()
-        return ast.LambdaExpr(start, params, body, [])
+        return ast.LambdaExpr(start, params, body, [], ret)
 
     def parse_binary(self, min_prec: int) -> ast.Expr:
         left = self.parse_unary()
@@ -753,13 +780,15 @@ class Parser:
             if prec is None or prec < min_prec:
                 break
             self.advance()
-            if op == "..":
-                # range: optional right operand
-                if self.peek().value in {")", "]", ",", "}"} or self.at("NEWLINE"):
+            if op in {"..", "..="}:
+                # range: `a..b` (exclusive) or `a..=b` (inclusive); `a..` is open
+                inclusive = op == "..="
+                if not inclusive and (self.peek().value in {")", "]", ",", "}", "do"}
+                                      or self.at("NEWLINE")):
                     left = ast.RangeExpr(tok.span, left, None, False)
                     continue
                 right = self.parse_binary(prec + 1)
-                left = ast.RangeExpr(tok.span, left, right, False)
+                left = ast.RangeExpr(tok.span, left, right, inclusive)
                 continue
             if op == "|>":
                 right = self.parse_binary(prec + 1)
