@@ -27,7 +27,7 @@ KEYWORDS = {
 # Multi-character operators, longest first so the scanner is greedy.
 OPERATORS = [
     "<<=", ">>=",
-    "?.", "==", "!=", "<=", ">=", "<<", ">>", "|>", "..", "->", "=>",
+    "..=", "?.", "==", "!=", "<=", ">=", "<<", ">>", "|>", "..", "->", "=>",
     "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
     "+", "-", "*", "/", "%", "<", ">", "=", "&", "|", "^", "~", "!",
     ".", ",", ":", ";", "(", ")", "{", "}", "[", "]", "?", "@",
@@ -305,8 +305,20 @@ class Lexer:
                 self._advance()
             raise lex_error("unterminated string literal", Span.point(self.source, start_line, start_col))
         self._advance()  # opening quote
+        depth = 0  # f-string interpolation nesting
         while self.pos < self.n:
             c = self._peek()
+            if kind == "FSTRING":
+                if c == "{":
+                    if depth == 0 and self._peek(1) == "{":
+                        self._advance(); self._advance()  # `{{` escape
+                        continue
+                    depth += 1
+                elif c == "}" and depth > 0:
+                    depth -= 1
+                elif c == '"' and depth > 0:
+                    self._skip_nested_string(start_line, start_col)
+                    continue
             if c == "\\" and kind != "RAWSTRING":
                 self._advance(); self._advance()
                 continue
@@ -325,6 +337,20 @@ class Lexer:
                 )
             self._advance()
         raise lex_error("unterminated string literal", Span.point(self.source, start_line, start_col))
+
+    def _skip_nested_string(self, start_line: int, start_col: int) -> None:
+        """Skip a string literal inside an f-string `{...}` interpolation."""
+        self._advance()  # opening quote
+        while self.pos < self.n and self._peek() != '"':
+            if self._peek() == "\n":
+                break
+            if self._peek() == "\\":
+                self._advance()
+            self._advance()
+        if self._peek() != '"':
+            raise lex_error("unterminated string literal",
+                            Span.point(self.source, start_line, start_col))
+        self._advance()
 
     def _scan_char(self) -> None:
         start_line, start_col, start = self.line, self.col, self.pos

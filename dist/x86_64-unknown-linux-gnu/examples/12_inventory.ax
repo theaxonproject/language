@@ -1,0 +1,84 @@
+use Core
+
+## A small inventory report: closures, tuples, generics, Option/Result
+## combinators, trait default methods, and `defer`. Compiles natively.
+
+enum Category
+    Tool
+    Part
+    Supply
+
+struct Item
+    name: str
+    category: Category
+    price: float64
+    stock: int
+
+trait Describe
+    fn label(self) -> str
+    fn describe(self) -> str = f"[{self.label()}]"
+
+impl Item as Describe
+    fn label(self) -> str
+        return f"{self.name} x{self.stock}"
+
+fn parse_item(line: str) -> Item!str
+    let (name, rest) = try line.split_once(",").ok_or(f"missing fields in `{line}`")
+    let fields = rest.split(",")
+    if fields.len() != 3 then
+        return Err(f"expected 4 fields in `{line}`")
+    let category = match fields[0].trim() do
+        case "tool" then Tool
+        case "part" then Part
+        case _ then Supply
+    let price = try fields[1].trim().parse(float64)
+    let stock = try fields[2].trim().parse(int)
+    return Ok(Item{ name: name.trim(), category: category, price: price, stock: stock })
+
+fn total_by[T](items: Vec(Item), key: fn(Item) -> T, value: fn(Item) -> float64) -> Vec((T, float64))
+    let mut out: Vec((T, float64)) = []
+    for item in items do
+        let k = key(item)
+        let mut found = false
+        for i in 0..out.len() do
+            let (existing, sum) = out[i]
+            if existing == k then
+                out[i] = (existing, sum + value(item))
+                found = true
+        if not found then
+            out.push((k, value(item)))
+    return out
+
+fn main() -> int
+    defer println("report done")
+    let lines = [
+        "hammer, tool, 12.5, 4",
+        "bolt, part, 0.25, 400",
+        "glue, supply, 3.0, 0",
+        "wrench, tool, 18.0, 2",
+        "broken line",
+    ]
+    let parsed = lines.map(l => parse_item(l))
+    let items = parsed.filter(r => r.is_ok()).map(r => r.unwrap())
+    let errors = parsed.filter(r => r.is_err()).map(r => r.unwrap_err())
+    println(f"parsed {items.len()} items, {errors.len()} errors")
+    for e in errors do
+        println(f"  skipped: {e}")
+
+    let in_stock = items.filter(i => i.stock > 0)
+    println(in_stock.map(i => i.describe()).join(" "))
+
+    let value = items.fold(0.0, (acc, i) => acc + i.price * i.stock as float64)
+    println(f"inventory value: {value}")
+
+    let cheapest = items.sort_by((a, b) => if a.price < b.price then -1 else 1).first()
+    println(f"cheapest: {cheapest.map(i => i.name).unwrap_or("none")}")
+
+    let by_category = total_by(items, i => i.category, i => i.price * i.stock as float64)
+    for (category, sum) in by_category do
+        println(f"  {category}: {sum}")
+
+    let restock = items.position(i => i.stock == 0)
+    if let Some(index) = restock then
+        println(f"restock needed: {items[index].name}")
+    return 0

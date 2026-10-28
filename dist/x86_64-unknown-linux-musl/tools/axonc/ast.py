@@ -189,6 +189,8 @@ class LetStmt(Node):
     # try/catch let form: `let x = try EXPR catch e then <block>`
     catch_name: Optional[str] = None
     catch_block: Optional[Block] = None
+    # destructuring form: `let (a, b) = EXPR` (name is then "_")
+    pattern: Optional["Pattern"] = None
 
 
 @dataclasses.dataclass
@@ -427,6 +429,7 @@ class LambdaExpr(Node):
     params: list[Param]
     body: object  # Expr (single-expression) or Block
     captures: list[str]
+    ret: Optional[TypeExpr] = None  # `fn(x: int) -> int = ...`
 
 
 @dataclasses.dataclass

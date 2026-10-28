@@ -45,18 +45,26 @@ static AxStr ax_fmt_uint(uint64_t v) {
     return ax_str_take(b);
 }
 
+/* Floats print exactly like the interpreter (Python's repr): integral
+ * values below 1e16 as `N.0`, otherwise the shortest round-tripping form,
+ * using exponent notation from 1e16 up and below 1e-4. */
 static AxStr ax_fmt_float(double v) {
     char *b = (char *)malloc(40);
-    /* shortest round-tripping representation, matching the interpreter */
-    for (int p = 1; p <= 17; p++) {
-        snprintf(b, 40, "%.*g", p, v);
-        if (strtod(b, NULL) == v) break;
-    }
-    if (!strpbrk(b, ".eEnN")) {  /* integral float -> append .0 (not for inf/nan) */
-        size_t n = strlen(b);
-        b[n] = '.';
-        b[n + 1] = '0';
-        b[n + 2] = '\0';
+    if (v != v) { strcpy(b, "nan"); return ax_str_take(b); }
+    if (v == INFINITY) { strcpy(b, "inf"); return ax_str_take(b); }
+    if (v == -INFINITY) { strcpy(b, "-inf"); return ax_str_take(b); }
+    if (v == floor(v) && fabs(v) < 1e16) {
+        snprintf(b, 40, "%.1f", v);
+    } else if (fabs(v) >= 1e16) {
+        for (int p = 0; p <= 17; p++) {
+            snprintf(b, 40, "%.*e", p, v);
+            if (strtod(b, NULL) == v) break;
+        }
+    } else {
+        for (int p = 1; p <= 17; p++) {
+            snprintf(b, 40, "%.*g", p, v);
+            if (strtod(b, NULL) == v) break;
+        }
     }
     return ax_str_take(b);
 }
@@ -108,6 +116,7 @@ static void ax_eprintln(AxStr s) {
 }
 
 static void ax_panic(AxStr msg) {
+    fflush(stdout);
     fputs("axon: panic: ", stderr);
     fwrite(msg.data, 1, (size_t)msg.len, stderr);
     fputc('\n', stderr);
@@ -118,13 +127,77 @@ static void ax_assert(bool cond, AxStr msg) {
     if (!cond) ax_panic(msg);
 }
 
+/* ---- integer arithmetic ----
+ * `int` is 64-bit two's complement. Debug builds (the default) panic on
+ * overflow, matching the interpreter; `--release` builds define AXON_RELEASE
+ * and wrap instead, as the language reference specifies. Wrapping goes
+ * through uint64_t so it is well-defined C. */
+
+static void ax_overflow(void) {
+    ax_panic(ax_str_lit("integer overflow"));
+}
+
+static int64_t ax_wrap(uint64_t v) {
+    return v > (uint64_t)INT64_MAX ? -(int64_t)(~v) - 1 : (int64_t)v;
+}
+
+static int64_t ax_iadd(int64_t a, int64_t b) {
+#ifndef AXON_RELEASE
+    if ((b > 0 && a > INT64_MAX - b) || (b < 0 && a < INT64_MIN - b)) ax_overflow();
+#endif
+    return ax_wrap((uint64_t)a + (uint64_t)b);
+}
+
+static int64_t ax_isub(int64_t a, int64_t b) {
+#ifndef AXON_RELEASE
+    if ((b < 0 && a > INT64_MAX + b) || (b > 0 && a < INT64_MIN + b)) ax_overflow();
+#endif
+    return ax_wrap((uint64_t)a - (uint64_t)b);
+}
+
+static int64_t ax_imul(int64_t a, int64_t b) {
+#ifndef AXON_RELEASE
+    if (a != 0 && b != 0) {
+        if (a == -1) { if (b == INT64_MIN) ax_overflow(); }
+        else if (b == -1) { if (a == INT64_MIN) ax_overflow(); }
+        else if (a > 0 ? (b > 0 ? a > INT64_MAX / b : b < INT64_MIN / a)
+                       : (b > 0 ? a < INT64_MIN / b : a < INT64_MAX / b)) ax_overflow();
+    }
+#endif
+    return ax_wrap((uint64_t)a * (uint64_t)b);
+}
+
+static int64_t ax_ineg(int64_t a) {
+#ifndef AXON_RELEASE
+    if (a == INT64_MIN) ax_overflow();
+#endif
+    return ax_wrap(0 - (uint64_t)a);
+}
+
+static int64_t ax_ishl(int64_t a, int64_t b) {
+    if (b < 0 || b > 63) ax_panic(ax_str_lit("shift amount out of range"));
+    return ax_wrap((uint64_t)a << b);
+}
+
+static int64_t ax_ishr(int64_t a, int64_t b) {
+    if (b < 0 || b > 63) ax_panic(ax_str_lit("shift amount out of range"));
+    return a < 0 ? ~(~a >> b) : a >> b; /* arithmetic shift, portably */
+}
+
 static int64_t ax_idiv(int64_t a, int64_t b) {
     if (b == 0) ax_panic(ax_str_lit("integer division by zero"));
+    if (a == INT64_MIN && b == -1) {
+#ifndef AXON_RELEASE
+        ax_overflow();
+#endif
+        return INT64_MIN;
+    }
     return a / b; /* C truncates toward zero, matching AXON */
 }
 
 static int64_t ax_imod(int64_t a, int64_t b) {
     if (b == 0) ax_panic(ax_str_lit("modulo by zero"));
+    if (b == -1) return 0;
     return a % b;
 }
 
@@ -132,11 +205,23 @@ static int64_t ax_ipow(int64_t base, int64_t exp) {
     int64_t out = 1;
     if (exp < 0) return 0;
     while (exp > 0) {
-        if (exp & 1) out *= base;
-        base *= base;
+        if (exp & 1) out = ax_imul(out, base);
         exp >>= 1;
+        if (exp > 0) base = ax_imul(base, base);
     }
     return out;
+}
+
+/* float -> int conversion: truncates toward zero; out of range is a panic
+ * (it is undefined behavior in C, and an overflow in the interpreter). */
+static int64_t ax_f2i(double v) {
+    if (v != v) ax_panic(ax_str_lit("cannot cast a non-finite float to int"));
+    if (!(v >= -9223372036854775808.0 && v < 9223372036854775808.0)) {
+        if (v == INFINITY || v == -INFINITY)
+            ax_panic(ax_str_lit("cannot cast a non-finite float to int"));
+        ax_overflow();
+    }
+    return (int64_t)v;
 }
 
 static void *ax_alloc(size_t n) {
@@ -378,7 +463,7 @@ static bool ax_write_file(AxStr path, AxStr data) {
     return wrote == (size_t)data.len;
 }
 
-static int64_t ax_iabs(int64_t v) { return v < 0 ? -v : v; }
+static int64_t ax_iabs(int64_t v) { return v < 0 ? ax_ineg(v) : v; }
 static int64_t ax_imax(int64_t a, int64_t b) { return a > b ? a : b; }
 static int64_t ax_imin(int64_t a, int64_t b) { return a < b ? a : b; }
 static int64_t ax_iclamp(int64_t v, int64_t lo, int64_t hi) {
@@ -386,4 +471,39 @@ static int64_t ax_iclamp(int64_t v, int64_t lo, int64_t hi) {
 }
 static double ax_fmax_(double a, double b) { return a > b ? a : b; }
 static double ax_fmin_(double a, double b) { return a < b ? a : b; }
-static int64_t ax_fround(double v) { return (int64_t)llround(v); }
+static int64_t ax_fround(double v) {
+    /* round half away from zero, like the interpreter */
+    return ax_f2i(v >= 0 ? floor(v + 0.5) : ceil(v - 0.5));
+}
+static int64_t ax_isignum(int64_t v) { return (v > 0) - (v < 0); }
+static double ax_fsqrt(double v) { return v < 0 ? NAN : sqrt(v); }
+static double ax_flog(double v) { return v > 0 ? log(v) : (v == 0 ? -INFINITY : NAN); }
+
+/* ---- process ---- */
+
+static int ax_argc = 0;
+static char **ax_argv = NULL;
+
+static void ax_exit(int64_t code) {
+    fflush(stdout);
+    exit((int)code);
+}
+
+static bool ax_getenv(AxStr name, AxStr *out) {
+    char *buf = (char *)ax_alloc((size_t)name.len + 1);
+    memcpy(buf, name.data, (size_t)name.len);
+    buf[name.len] = '\0';
+    const char *v = getenv(buf);
+    free(buf);
+    if (v == NULL) return false;
+    *out = ax_str_from(v, (int64_t)strlen(v));
+    return true;
+}
+
+static int64_t ax_str_find(AxStr s, AxStr needle) {
+    if (needle.len == 0) return 0;
+    for (int64_t i = 0; i + needle.len <= s.len; i++) {
+        if (memcmp(s.data + i, needle.data, (size_t)needle.len) == 0) return i;
+    }
+    return -1;
+}

@@ -14,6 +14,27 @@ class AxPanic(Exception):
         self.message = message
 
 
+class AxExit(Exception):
+    """Raised by `Process.exit(code)` to end the program with a status."""
+
+    def __init__(self, code: int) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+# `int` is a 64-bit two's-complement integer on every AXON target. The
+# interpreter runs with debug semantics: arithmetic that leaves this range
+# panics, exactly like a debug-mode native build.
+INT_MIN = -(1 << 63)
+INT_MAX = (1 << 63) - 1
+
+
+def check_int(value: Any) -> Any:
+    if type(value) is int and not (INT_MIN <= value <= INT_MAX):
+        raise AxPanic("integer overflow")
+    return value
+
+
 @dataclasses.dataclass
 class AxOption:
     is_some: bool
@@ -110,6 +131,8 @@ def ax_str(value: Any) -> str:
     if value is None:
         return "none"
     if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return repr(value)  # nan / inf / -inf
         if value == int(value) and abs(value) < 1e16:
             return f"{value:.1f}"
         return repr(value)
@@ -131,3 +154,32 @@ def ax_str(value: Any) -> str:
         sep = "..=" if value.inclusive else ".."
         return f"{value.start}{sep}{value.end}"
     return str(value)
+
+
+def ax_type_name(value: Any) -> str:
+    """The AXON-level type name of a runtime value (for `type_name`)."""
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float64"
+    if isinstance(value, str):
+        return "str"
+    if isinstance(value, list):
+        return "Vec"
+    if isinstance(value, dict):
+        return "Map"
+    if isinstance(value, tuple):
+        return "(" + ", ".join(ax_type_name(v) for v in value) + ")"
+    if isinstance(value, AxOption):
+        return "Option"
+    if isinstance(value, AxResult):
+        return "Result"
+    if isinstance(value, (AxStruct, AxEnum)):
+        return value.type_name
+    if isinstance(value, AxType):
+        return value.name
+    if value is None:
+        return "void"
+    return type(value).__name__

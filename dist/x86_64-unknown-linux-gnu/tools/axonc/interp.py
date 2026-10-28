@@ -7,14 +7,17 @@ AST to native code.
 
 from __future__ import annotations
 
+import math
+import sys
+import threading
 from typing import Any
 
 from . import ast
 from .errors import Diagnostic
 from . import stdlib
 from .values import (
-    AxEnum, AxOption, AxPanic, AxRange, AxResult, AxStruct, AxType,
-    NONE, ax_str, err, ok, some,
+    AxEnum, AxExit, AxOption, AxPanic, AxRange, AxResult, AxStruct, AxType,
+    NONE, ax_str, check_int, err, ok, some,
 )
 
 
@@ -123,6 +126,12 @@ class Interpreter:
                 for m in item.methods:
                     if m.body is not None:
                         table.setdefault(m.name, m)
+        # trait default methods are inherited by every implementing type
+        for item in module.items:
+            if isinstance(item, ast.ImplBlock) and item.trait_name in self.methods:
+                table = self.methods.setdefault(item.type_name, {})
+                for mname, m in self.methods[item.trait_name].items():
+                    table.setdefault(mname, m)
         for item in module.items:
             if isinstance(item, ast.Const):
                 self.consts[item.name] = self.eval(item.value, Env())
@@ -132,7 +141,10 @@ class Interpreter:
         main = self.functions.get("main")
         if main is None:
             raise Diagnostic("E120", "program has no `main` function")
-        result = self.call_function(main, [], {}, None)
+        try:
+            result = self.call_function(main, [], {}, None)
+        except AxExit as exc:
+            return exc.code
         if result is None:
             return 0
         if isinstance(result, int) and not isinstance(result, bool):
@@ -147,7 +159,6 @@ class Interpreter:
             env.define("self", self_val)
             params = params[1:]
         self._bind_params(fn, params, args, kwargs, env)
-        self.defer_stack.append([])
         try:
             if fn.body is not None:
                 self.exec_block(fn.body, env)
@@ -156,8 +167,6 @@ class Interpreter:
             return r.value
         except PropagateSignal as p:
             return p.value
-        finally:
-            self._run_defers()
 
     def _bind_params(self, fn, params, args, kwargs, env) -> None:
         i = 0
@@ -179,16 +188,16 @@ class Interpreter:
         if isinstance(func, AxClosure):
             env = Env(func.env)
             self._bind_params(None, func.params, args, kwargs, env)
-            if isinstance(func.body, ast.Block):
-                self.defer_stack.append([])
-                try:
+            try:
+                if isinstance(func.body, ast.Block):
                     self.exec_block(func.body, env)
                     return None
-                except ReturnSignal as r:
-                    return r.value
-                finally:
-                    self._run_defers()
-            return self.eval(func.body, env)
+                return self.eval(func.body, env)
+            except ReturnSignal as r:
+                return r.value
+            except PropagateSignal as p:
+                # `try` inside a closure returns the failure from the closure
+                return p.value
         if isinstance(func, ast.FnDef):
             return self.call_function(func, args, kwargs, None)
         if isinstance(func, AxType):
@@ -203,15 +212,18 @@ class Interpreter:
     def _run_defers(self) -> None:
         frame = self.defer_stack.pop()
         for expr, env in reversed(frame):
-            try:
-                self.eval(expr, env)
-            except Exception:
-                pass
+            self.eval(expr, env)
 
     # -- statements -----------------------------------------------------------
     def exec_block(self, block: ast.Block, env: Env) -> None:
-        for stmt in block.stmts:
-            self.exec_stmt(stmt, env)
+        # `defer` is block-scoped: deferred expressions run, last-in
+        # first-out, when the enclosing block exits by any route.
+        self.defer_stack.append([])
+        try:
+            for stmt in block.stmts:
+                self.exec_stmt(stmt, env)
+        finally:
+            self._run_defers()
 
     def exec_stmt(self, stmt: ast.Node, env: Env) -> None:
         kind = type(stmt)
@@ -264,6 +276,10 @@ class Interpreter:
             env.define(stmt.name, unwrapped)
             return
         value = self.eval(stmt.value, env) if stmt.value is not None else None
+        if stmt.pattern is not None:
+            if not self.match_pattern(stmt.pattern, value, env):
+                raise AxPanic(f"`let` pattern did not match {ax_str(value)}")
+            return
         env.define(stmt.name, value)
 
     def exec_assign(self, stmt: ast.AssignStmt, env: Env) -> None:
@@ -285,7 +301,10 @@ class Interpreter:
         elif isinstance(target, ast.IndexExpr):
             obj = self.eval(target.recv, env)
             idx = self.eval(target.index, env)
-            obj[idx] = value
+            if isinstance(obj, list):
+                obj[stdlib._vec_index(obj, int(idx))] = value
+            else:
+                obj[idx] = value
         else:
             raise AxPanic("invalid assignment target")
 
@@ -466,22 +485,36 @@ class Interpreter:
 
     def _binary(self, op: str, a: Any, b: Any) -> Any:
         if op == "+":
-            return a + b
+            if isinstance(a, str) != isinstance(b, str):
+                raise AxPanic("cannot add `str` and a non-str value")
+            return check_int(a + b)
         if op == "-":
-            return a - b
+            return check_int(a - b)
         if op == "*":
-            return a * b
+            if isinstance(a, str):
+                return a * max(0, b)
+            return check_int(a * b)
         if op == "/":
             if isinstance(a, int) and isinstance(b, int):
                 if b == 0:
                     raise AxPanic("integer division by zero")
                 q = abs(a) // abs(b)
-                return q if (a < 0) == (b < 0) else -q
+                return check_int(q if (a < 0) == (b < 0) else -q)
+            if b == 0:
+                # IEEE 754 semantics, like the native backend
+                if a == 0 or a != a:
+                    return math.nan
+                return math.copysign(math.inf, a) * math.copysign(1.0, b)
             return a / b
         if op == "%":
+            if isinstance(a, int) and isinstance(b, int):
+                if b == 0:
+                    raise AxPanic("modulo by zero")
+                r = abs(a) % abs(b)  # C semantics: sign follows the dividend
+                return r if a >= 0 else -r
             if b == 0:
-                raise AxPanic("modulo by zero")
-            return a - b * int(a / b) if isinstance(a, int) and isinstance(b, int) else a % b
+                return float("nan")
+            return math.fmod(a, b)
         if op == "==":
             return a == b
         if op == "!=":
@@ -495,8 +528,13 @@ class Interpreter:
         if op == ">=":
             return a >= b
         if op == "<<":
-            return a << b
+            if not 0 <= b < 64:
+                raise AxPanic("shift amount out of range")
+            v = (a << b) & 0xFFFFFFFFFFFFFFFF  # two's-complement wrap like C
+            return v - (1 << 64) if v >= 1 << 63 else v
         if op == ">>":
+            if not 0 <= b < 64:
+                raise AxPanic("shift amount out of range")
             return a >> b
         if op == "&":
             return a & b
@@ -512,7 +550,7 @@ class Interpreter:
         v = self.eval(node.operand, env)
         op = node.op
         if op == "-":
-            return -v
+            return check_int(-v)
         if op == "+":
             return +v
         if op == "not":
@@ -535,7 +573,7 @@ class Interpreter:
                 return NONE
             base = recv.value if isinstance(recv, AxOption) else recv
             args, kwargs = self.eval_args(node.args, env)
-            return self.dispatch_method(base, callee.name, args, kwargs)
+            return some(self.dispatch_method(base, callee.name, args, kwargs))
         func = self.eval(callee, env)
         args, kwargs = self.eval_args(node.args, env)
         return self.call_value(func, args, kwargs)
@@ -628,12 +666,15 @@ class Interpreter:
     def eval_index(self, node: ast.IndexExpr, env: Env) -> Any:
         recv = self.eval(node.recv, env)
         index = self.eval(node.index, env)
-        if isinstance(index, AxRange):
-            stop = index.end + 1 if index.inclusive else index.end
-            return recv[index.start:stop]
         if isinstance(recv, dict):
+            if index not in recv:
+                raise AxPanic(f"missing map key: {ax_str(index)}")
             return recv[index]
-        return recv[index]
+        if isinstance(recv, (str, list)):
+            return stdlib._apply_slice(recv, index)
+        if isinstance(recv, tuple):
+            return recv[int(index)]
+        raise AxPanic(f"cannot index a value of type {type(recv).__name__}")
 
     def eval_range(self, node: ast.RangeExpr, env: Env) -> AxRange:
         start = int(self.eval(node.start, env)) if node.start is not None else 0
@@ -728,9 +769,13 @@ class Interpreter:
             if n.startswith("float"):
                 return float(v)
             if n.startswith("int") or n.startswith("uint") or n in {"int", "uint", "byte"}:
-                return int(v)
+                if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
+                    raise AxPanic("cannot cast a non-finite float to int")
+                return check_int(int(v))
             if n == "str":
                 return ax_str(v)
+            if n == "bool":
+                return self._truthy(v)
         return v
 
     def eval_match(self, node: ast.MatchExpr, env: Env) -> Any:
@@ -745,11 +790,15 @@ class Interpreter:
 
     def run_block_value(self, block: ast.Block, env: Env) -> Any:
         result = None
-        for i, stmt in enumerate(block.stmts):
-            if i == len(block.stmts) - 1 and isinstance(stmt, ast.ExprStmt):
-                result = self.eval(stmt.expr, env)
-            else:
-                self.exec_stmt(stmt, env)
+        self.defer_stack.append([])
+        try:
+            for i, stmt in enumerate(block.stmts):
+                if i == len(block.stmts) - 1 and isinstance(stmt, ast.ExprStmt):
+                    result = self.eval(stmt.expr, env)
+                else:
+                    self.exec_stmt(stmt, env)
+        finally:
+            self._run_defers()
         return result
 
     # -- pattern matching -----------------------------------------------------
@@ -807,5 +856,51 @@ class Interpreter:
         return bool(value)
 
 
+def run_with_deep_stack(fn, *args):
+    """Run `fn(*args)` on a thread with a large stack.
+
+    The tree-walking evaluator uses several Python frames per AXON call, so
+    the default recursion limit would cap AXON recursion at a few hundred
+    levels. A dedicated thread with a big stack lets deeply recursive AXON
+    programs behave like their native counterparts; genuine runaway
+    recursion is reported as a panic instead of crashing the host.
+    """
+    outcome: dict = {}
+
+    def target() -> None:
+        try:
+            outcome["value"] = fn(*args)
+        except RecursionError:
+            outcome["error"] = AxPanic("stack overflow")
+        except BaseException as exc:  # re-raised on the calling thread
+            outcome["error"] = exc
+
+    old_limit = sys.getrecursionlimit()
+    old_size = threading.stack_size()
+    try:
+        stack_mb = 0
+        for mb in (512, 256, 64):  # some platforms cap thread stacks
+            try:
+                threading.stack_size(mb * 1024 * 1024)
+                stack_mb = mb
+                break
+            except (ValueError, RuntimeError):
+                continue
+        # CPython 3.11+ runs Python-to-Python calls without consuming the C
+        # stack; older versions need a limit the stack can actually hold.
+        per_mb = 2000 if sys.version_info >= (3, 11) else 150
+        limit = max(old_limit, min(1_000_000, stack_mb * per_mb))
+        sys.setrecursionlimit(limit)
+        worker = threading.Thread(target=target)
+        worker.start()
+        worker.join()
+    finally:
+        threading.stack_size(old_size)
+        sys.setrecursionlimit(old_limit)
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("value")
+
+
 def interpret(module: ast.Module, argv: list[str] | None = None) -> int:
-    return Interpreter(module, argv).run_main()
+    return run_with_deep_stack(Interpreter(module, argv).run_main)

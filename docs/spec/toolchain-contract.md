@@ -15,6 +15,22 @@ Unsupported native constructs fail with E800 rather than falling back to an
 interpreter. `axc run --interpret FILE [args...]` explicitly selects the
 interpreter for the broader implemented language surface.
 
+`axc check FILES...` parses, resolves names, and type-checks without running
+or compiling. Every other command performs the same checks first and refuses
+to run a program that fails them.
+
+`axc test [FILES or DIRS...]` runs every `@test` function (see the standard
+library contract) through the interpreter and prints one line per test plus a
+summary; it exits non-zero when any test fails. Without paths it discovers
+`*_test.ax` files and any source file that declares `@test` functions.
+Files without `@test` functions are run as programs whose `main` must
+succeed.
+
+`axrepl` evaluates statements in a persistent scope (`let` bindings survive
+between inputs), prints expression values, and accepts item definitions
+(`fn`, `struct`, `enum`, `impl`, `trait`, `const`); a line ending in `do` or
+`then`, or an item header, opens a block that an empty line closes.
+
 ## axbuild
 
 `axbuild` is the project build system.
@@ -26,7 +42,7 @@ Commands:
 | `axbuild build` | Build debug profile. |
 | `axbuild build --release` | Build release profile with profile-defined optimization. |
 | `axbuild run [args]` | Build and run the package binary. |
-| `axbuild test` | Build and run all tests. |
+| `axbuild test` | Run every `@test` function and `*_test.ax` program. |
 | `axbuild test --coverage` | Run tests and emit coverage reports. |
 | `axbuild bench` | Run benchmarks. |
 | `axbuild clean` | Remove build artifacts. |
